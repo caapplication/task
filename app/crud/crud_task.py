@@ -1,0 +1,143 @@
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import and_, or_
+from uuid import UUID
+from datetime import datetime
+from typing import List, Optional
+
+from app.models.task import Task, TaskStatus
+from app.models.activity_log import ActivityLog
+from app.schemas.task import TaskCreate, TaskUpdate
+from app.schemas.activity_log import ActivityLogBase
+
+def create_task(db: Session, task: TaskCreate, agency_id: UUID, user_id: UUID) -> Task:
+    task_data = task.model_dump(exclude={"document_request"})
+    document_request = task.document_request.model_dump() if task.document_request else None
+    
+    db_task = Task(
+        **task_data,
+        agency_id=agency_id,
+        created_by=user_id,
+        document_request=document_request,
+        status=TaskStatus.pending
+    )
+    db.add(db_task)
+    db.commit()
+    db.refresh(db_task)
+    
+    # Create activity log
+    activity_log = ActivityLog(
+        task_id=db_task.id,
+        user_id=user_id,
+        action=f"Task created: {db_task.title}",
+        details=f"Task '{db_task.title}' was created",
+        event_type="task_created",
+        to_value={"title": db_task.title, "status": db_task.status.value}
+    )
+    db.add(activity_log)
+    db.commit()
+    
+    return db_task
+
+def get_task(db: Session, task_id: UUID, agency_id: UUID) -> Optional[Task]:
+    return db.query(Task).options(
+        joinedload(Task.subtasks),
+        joinedload(Task.timers),
+        joinedload(Task.activity_logs)
+    ).filter(
+        and_(Task.id == task_id, Task.agency_id == agency_id)
+    ).first()
+
+def get_tasks_by_agency(
+    db: Session,
+    agency_id: UUID,
+    client_id: Optional[UUID] = None,
+    assigned_to: Optional[UUID] = None,
+    status: Optional[TaskStatus] = None,
+    skip: int = 0,
+    limit: int = 100
+) -> List[Task]:
+    query = db.query(Task).filter(Task.agency_id == agency_id)
+    
+    if client_id:
+        query = query.filter(Task.client_id == client_id)
+    if assigned_to:
+        query = query.filter(Task.assigned_to == assigned_to)
+    if status:
+        query = query.filter(Task.status == status)
+    
+    return query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+
+def update_task(
+    db: Session,
+    task_id: UUID,
+    task_update: TaskUpdate,
+    agency_id: UUID,
+    user_id: UUID
+) -> Optional[Task]:
+    db_task = get_task(db, task_id, agency_id)
+    if not db_task:
+        return None
+    
+    # Track changes for activity log
+    changes = []
+    update_data = task_update.model_dump(exclude_unset=True)
+    
+    # Handle document_request separately
+    if "document_request" in update_data:
+        document_request = update_data.pop("document_request")
+        if document_request:
+            db_task.document_request = document_request.model_dump() if hasattr(document_request, 'model_dump') else document_request
+        else:
+            db_task.document_request = None
+    
+    for key, value in update_data.items():
+        if value is not None:
+            old_value = getattr(db_task, key)
+            if old_value != value:
+                changes.append({
+                    "field": key,
+                    "from": str(old_value) if old_value is not None else None,
+                    "to": str(value) if value is not None else None
+                })
+                setattr(db_task, key, value)
+    
+    db_task.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(db_task)
+    
+    # Create activity log for changes
+    if changes:
+        change_details = ", ".join([f"{c['field']}: {c['from']} → {c['to']}" for c in changes])
+        activity_log = ActivityLog(
+            task_id=db_task.id,
+            user_id=user_id,
+            action=f"Task updated: {db_task.title}",
+            details=f"Changes: {change_details}",
+            event_type="task_updated",
+            from_value={c["field"]: c["from"] for c in changes},
+            to_value={c["field"]: c["to"] for c in changes}
+        )
+        db.add(activity_log)
+        db.commit()
+    
+    return db_task
+
+def delete_task(db: Session, task_id: UUID, agency_id: UUID, user_id: UUID) -> bool:
+    db_task = get_task(db, task_id, agency_id)
+    if not db_task:
+        return False
+    
+    # Create activity log before deletion
+    activity_log = ActivityLog(
+        task_id=db_task.id,
+        user_id=user_id,
+        action=f"Task deleted: {db_task.title}",
+        details=f"Task '{db_task.title}' was deleted",
+        event_type="task_deleted"
+    )
+    db.add(activity_log)
+    
+    db.delete(db_task)
+    db.commit()
+    return True
+
