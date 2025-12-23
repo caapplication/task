@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.routers import tasks, todos, recurring_tasks, scheduler
+from app.routers import tasks, todos, recurring_tasks, scheduler, task_stages, task_comments
 
 app = FastAPI(title="Task Management API", version="1.0.0")
 
@@ -39,6 +39,8 @@ async def db_session_middleware(request: Request, call_next):
 
 # Include routers
 app.include_router(tasks.router, prefix="/tasks", tags=["tasks"])
+app.include_router(task_stages.router, prefix="/task-stages", tags=["task-stages"])
+app.include_router(task_comments.router, tags=["task-comments"])
 app.include_router(todos.router, prefix="/todos", tags=["todos"])
 app.include_router(recurring_tasks.router, tags=["recurring-tasks"])
 app.include_router(scheduler.router, tags=["scheduler"])

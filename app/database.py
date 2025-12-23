@@ -16,7 +16,7 @@ def get_db():
         db.close()
 
 # Import models to register them with Base
-from app.models import task, todo, task_subtask, task_timer, activity_log
+from app.models import task, todo, task_subtask, task_timer, activity_log, task_stage, task_comment
 
 # Create tables
 Base.metadata.create_all(bind=engine)

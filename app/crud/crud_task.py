@@ -2,22 +2,43 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import and_, or_
 from uuid import UUID
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 
 from app.models.task import Task, TaskStatus
 from app.models.activity_log import ActivityLog
 from app.schemas.task import TaskCreate, TaskUpdate
 from app.schemas.activity_log import ActivityLogBase
 
+def convert_uuid_to_str(obj: Any) -> Any:
+    """Recursively convert UUID objects to strings for JSON serialization"""
+    if isinstance(obj, UUID):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {key: convert_uuid_to_str(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_uuid_to_str(item) for item in obj]
+    return obj
+
 def create_task(db: Session, task: TaskCreate, agency_id: UUID, user_id: UUID) -> Task:
-    task_data = task.model_dump(exclude={"document_request"})
-    document_request = task.document_request.model_dump() if task.document_request else None
+    # Exclude recurring task fields and JSON fields from task_data
+    task_data = task.model_dump(exclude={
+        "document_request", 
+        "checklist",
+        "is_recurring",
+        "recurrence_frequency",
+        "recurrence_day_of_week",
+        "recurrence_day_of_month",
+        "recurrence_start_date"
+    })
+    document_request = convert_uuid_to_str(task.document_request.model_dump()) if task.document_request else None
+    checklist = convert_uuid_to_str(task.checklist.model_dump()) if task.checklist else None
     
     db_task = Task(
         **task_data,
         agency_id=agency_id,
         created_by=user_id,
         document_request=document_request,
+        checklist=checklist,
         status=TaskStatus.pending
     )
     db.add(db_task)
@@ -42,7 +63,8 @@ def get_task(db: Session, task_id: UUID, agency_id: UUID) -> Optional[Task]:
     return db.query(Task).options(
         joinedload(Task.subtasks),
         joinedload(Task.timers),
-        joinedload(Task.activity_logs)
+        joinedload(Task.activity_logs),
+        joinedload(Task.stage)  # Load stage relationship
     ).filter(
         and_(Task.id == task_id, Task.agency_id == agency_id)
     ).first()
@@ -56,7 +78,9 @@ def get_tasks_by_agency(
     skip: int = 0,
     limit: int = 100
 ) -> List[Task]:
-    query = db.query(Task).filter(Task.agency_id == agency_id)
+    query = db.query(Task).options(
+        joinedload(Task.stage)  # Load stage relationship for Kanban view
+    ).filter(Task.agency_id == agency_id)
     
     if client_id:
         query = query.filter(Task.client_id == client_id)
@@ -86,9 +110,64 @@ def update_task(
     if "document_request" in update_data:
         document_request = update_data.pop("document_request")
         if document_request:
-            db_task.document_request = document_request.model_dump() if hasattr(document_request, 'model_dump') else document_request
+            if hasattr(document_request, 'model_dump'):
+                db_task.document_request = convert_uuid_to_str(document_request.model_dump())
+            else:
+                db_task.document_request = convert_uuid_to_str(document_request)
         else:
             db_task.document_request = None
+    
+    # Handle checklist separately
+    if "checklist" in update_data:
+        old_checklist = db_task.checklist
+        checklist = update_data.pop("checklist")
+        if checklist:
+            if hasattr(checklist, 'model_dump'):
+                new_checklist = convert_uuid_to_str(checklist.model_dump())
+            else:
+                new_checklist = convert_uuid_to_str(checklist)
+            db_task.checklist = new_checklist
+            
+            # Log checklist changes
+            if old_checklist != new_checklist:
+                # Compare items to detect specific changes
+                old_items = old_checklist.get('items', []) if isinstance(old_checklist, dict) else []
+                new_items = new_checklist.get('items', []) if isinstance(new_checklist, dict) else []
+                
+                # Find completed/uncompleted items
+                old_completed = {item.get('name'): item.get('is_completed', False) for item in old_items if isinstance(item, dict)}
+                new_completed = {item.get('name'): item.get('is_completed', False) for item in new_items if isinstance(item, dict)}
+                
+                checklist_changes = []
+                for item_name in set(list(old_completed.keys()) + list(new_completed.keys())):
+                    old_status = old_completed.get(item_name, False)
+                    new_status = new_completed.get(item_name, False)
+                    if old_status != new_status:
+                        checklist_changes.append(f"{item_name}: {'completed' if new_status else 'uncompleted'}")
+                
+                if checklist_changes:
+                    activity_log = ActivityLog(
+                        task_id=db_task.id,
+                        user_id=user_id,
+                        action="Checklist updated",
+                        details=f"Checklist items changed: {', '.join(checklist_changes)}",
+                        event_type="checklist_updated",
+                        from_value={"checklist": old_checklist},
+                        to_value={"checklist": new_checklist}
+                    )
+                    db.add(activity_log)
+        else:
+            db_task.checklist = None
+            if old_checklist:
+                activity_log = ActivityLog(
+                    task_id=db_task.id,
+                    user_id=user_id,
+                    action="Checklist removed",
+                    details="Checklist was removed from the task",
+                    event_type="checklist_removed",
+                    from_value={"checklist": old_checklist}
+                )
+                db.add(activity_log)
     
     for key, value in update_data.items():
         if value is not None:
