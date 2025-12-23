@@ -24,12 +24,128 @@ def create_task(
     current_user: dict = Depends(get_current_user),
     current_agency: dict = Depends(get_current_agency),
 ):
-    return crud_task.create_task(
-        db=db,
-        task=task,
-        agency_id=current_agency["id"],
-        user_id=UUID(current_user["id"])
-    )
+    from app.schemas.task import Task as TaskSchema
+    from app.schemas.recurring_task import RecurringTaskCreate, RecurrenceFrequency
+    import traceback
+    
+    try:
+        # Create the regular task first
+        db_task = crud_task.create_task(
+            db=db,
+            task=task,
+            agency_id=current_agency["id"],
+            user_id=UUID(current_user["id"])
+        )
+        
+        # If this is a recurring task, create the recurring task template
+        if task.is_recurring and task.recurrence_frequency and task.recurrence_start_date:
+            from app import crud
+            
+            # Map frequency string to enum
+            frequency_map = {
+                'weekly': RecurrenceFrequency.weekly,
+                'monthly': RecurrenceFrequency.monthly
+            }
+            
+            recurring_task_data = RecurringTaskCreate(
+                title=task.title,
+                description=task.description,
+                client_id=task.client_id,
+                service_id=task.service_id,
+                priority=task.priority,
+                assigned_to=task.assigned_to,
+                tag_id=task.tag_id,
+                document_request=task.document_request,
+                frequency=frequency_map.get(task.recurrence_frequency, RecurrenceFrequency.weekly),
+                interval=1,  # Every week/month
+                start_date=task.recurrence_start_date,
+                end_date=None,
+                day_of_week=task.recurrence_day_of_week if task.recurrence_frequency == 'weekly' else None,
+                day_of_month=task.recurrence_day_of_month if task.recurrence_frequency == 'monthly' else None,
+                week_of_month=None,
+                due_date_offset=0,
+                target_date_offset=None,
+                is_active=True
+            )
+            
+            # Create the recurring task
+            crud.crud_recurring_task.create_recurring_task(
+                db=db,
+                recurring_task=recurring_task_data,
+                agency_id=current_agency["id"],
+                user_id=UUID(current_user["id"])
+            )
+        
+        # Serialize the task properly like get_task does
+        subtasks_list = []
+        if db_task.subtasks:
+            for subtask in db_task.subtasks:
+                subtasks_list.append({
+                    "id": subtask.id,
+                    "task_id": subtask.task_id,
+                    "title": subtask.title,
+                    "description": subtask.description,
+                    "is_completed": subtask.is_completed,
+                    "sort_order": subtask.sort_order,
+                    "created_at": subtask.created_at,
+                    "updated_at": subtask.updated_at
+                })
+        
+        task_dict = {
+            "id": db_task.id,
+            "agency_id": db_task.agency_id,
+            "client_id": db_task.client_id,
+            "service_id": db_task.service_id,
+            "title": db_task.title,
+            "description": db_task.description,
+            "status": db_task.status,
+            "stage_id": db_task.stage_id,
+            "priority": db_task.priority,
+            "due_date": db_task.due_date,
+            "target_date": db_task.target_date,
+            "assigned_to": db_task.assigned_to,
+            "tag_id": db_task.tag_id,
+            "document_request": db_task.document_request,
+            "checklist": db_task.checklist,
+            "created_by": db_task.created_by,
+            "created_at": db_task.created_at,
+            "updated_at": db_task.updated_at,
+            "total_logged_seconds": 0,
+            "is_timer_running_for_me": False,
+            "subtasks": subtasks_list
+        }
+        
+        # Include stage object if stage_id is set (load it if needed)
+        if db_task.stage_id:
+            # Try to access stage, if not loaded, query it
+            if db_task.stage:
+                task_dict["stage"] = {
+                    "id": db_task.stage.id,
+                    "name": db_task.stage.name,
+                    "color": db_task.stage.color,
+                    "description": db_task.stage.description
+                }
+            else:
+                # Load stage if not already loaded
+                from app.models.task_stage import TaskStage
+                stage = db.query(TaskStage).filter(TaskStage.id == db_task.stage_id).first()
+                if stage:
+                    task_dict["stage"] = {
+                        "id": stage.id,
+                        "name": stage.name,
+                        "color": stage.color,
+                        "description": stage.description
+                    }
+        
+        return TaskSchema(**task_dict)
+    except Exception as e:
+        error_trace = traceback.format_exc()
+        print(f"Error creating task: {str(e)}")
+        print(f"Traceback: {error_trace}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating task: {str(e)}. Please check server logs for details."
+        )
 
 @router.get("/", response_model=List[TaskListItem])
 def list_tasks(
@@ -42,6 +158,8 @@ def list_tasks(
     current_user: dict = Depends(get_current_user),
     current_agency: dict = Depends(get_current_agency),
 ):
+    from app.schemas.task import TaskListItem
+    
     tasks = crud_task.get_tasks_by_agency(
         db=db,
         agency_id=current_agency["id"],
@@ -51,8 +169,36 @@ def list_tasks(
         skip=skip,
         limit=limit
     )
-    # Return as list directly (frontend handles both array and {items: []} format)
-    return tasks
+    
+    # Serialize tasks with stage information for Kanban view
+    task_list = []
+    for task in tasks:
+        task_dict = {
+            "id": task.id,
+            "title": task.title,
+            "client_id": task.client_id,
+            "service_id": task.service_id,
+            "status": task.status,
+            "stage_id": task.stage_id,  # Include stage_id
+            "priority": task.priority,
+            "due_date": task.due_date,
+            "assigned_to": task.assigned_to,
+            "tag_id": task.tag_id,
+            "created_at": task.created_at,
+        }
+        
+        # Include stage object if loaded
+        if task.stage:
+            task_dict["stage"] = {
+                "id": task.stage.id,
+                "name": task.stage.name,
+                "color": task.stage.color,
+                "description": task.stage.description
+            }
+        
+        task_list.append(TaskListItem(**task_dict))
+    
+    return task_list
 
 @router.get("/{task_id}", response_model=Task)
 def get_task(
@@ -122,12 +268,14 @@ def get_task(
         "title": task.title,
         "description": task.description,
         "status": task.status,
+        "stage_id": task.stage_id,
         "priority": task.priority,
         "due_date": task.due_date,
         "target_date": task.target_date,
         "assigned_to": task.assigned_to,
         "tag_id": task.tag_id,
         "document_request": task.document_request,
+        "checklist": task.checklist,
         "created_by": task.created_by,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
@@ -135,6 +283,15 @@ def get_task(
         "is_timer_running_for_me": is_timer_running_for_me,
         "subtasks": subtasks_list
     }
+    
+    # Include stage object if loaded
+    if task.stage:
+        task_dict["stage"] = {
+            "id": task.stage.id,
+            "name": task.stage.name,
+            "color": task.stage.color,
+            "description": task.stage.description
+        }
     
     return TaskSchema(**task_dict)
 
@@ -146,6 +303,10 @@ def update_task(
     current_user: dict = Depends(get_current_user),
     current_agency: dict = Depends(get_current_agency),
 ):
+    from app.schemas.task import Task as TaskSchema
+    from app.models.task_timer import TaskTimer
+    from datetime import datetime, timezone
+    
     task = crud_task.update_task(
         db=db,
         task_id=task_id,
@@ -155,7 +316,89 @@ def update_task(
     )
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    return task
+    
+    # Reload task with relationships
+    db.refresh(task)
+    if task.stage_id and not task.stage:
+        from app.models.task_stage import TaskStage
+        task.stage = db.query(TaskStage).filter(TaskStage.id == task.stage_id).first()
+    
+    # Calculate total logged seconds
+    all_timers = db.query(TaskTimer).filter(TaskTimer.task_id == task_id).all()
+    total_seconds = 0
+    for timer in all_timers:
+        if timer.is_active and timer.start_time:
+            now = datetime.now(timezone.utc)
+            elapsed = int((now - timer.start_time).total_seconds())
+            total_seconds += elapsed
+        else:
+            total_seconds += timer.duration_seconds or 0
+    
+    # Check if current user has an active timer
+    user_id_str = current_user.get("id")
+    is_timer_running_for_me = False
+    if user_id_str:
+        try:
+            user_id = UUID(user_id_str)
+            active_timer = db.query(TaskTimer).filter(
+                TaskTimer.task_id == task_id,
+                TaskTimer.user_id == user_id,
+                TaskTimer.is_active == True
+            ).first()
+            is_timer_running_for_me = active_timer is not None
+        except (ValueError, TypeError):
+            pass
+    
+    # Serialize subtasks
+    subtasks_list = []
+    if task.subtasks:
+        for subtask in task.subtasks:
+            subtasks_list.append({
+                "id": subtask.id,
+                "task_id": subtask.task_id,
+                "title": subtask.title,
+                "description": subtask.description,
+                "is_completed": subtask.is_completed,
+                "sort_order": subtask.sort_order,
+                "created_at": subtask.created_at,
+                "updated_at": subtask.updated_at
+            })
+    
+    # Serialize task with stage information
+    task_dict = {
+        "id": task.id,
+        "agency_id": task.agency_id,
+        "client_id": task.client_id,
+        "service_id": task.service_id,
+        "title": task.title,
+        "description": task.description,
+        "status": task.status,
+        "stage_id": task.stage_id,
+        "priority": task.priority,
+        "due_date": task.due_date,
+        "target_date": task.target_date,
+        "assigned_to": task.assigned_to,
+        "tag_id": task.tag_id,
+        "document_request": task.document_request,
+        "checklist": task.checklist,
+        "created_by": task.created_by,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+        "total_logged_seconds": total_seconds,
+        "is_timer_running_for_me": is_timer_running_for_me,
+        "subtasks": subtasks_list
+    }
+    
+    # Include stage object if loaded
+    if task.stage:
+        task_dict["stage"] = {
+            "id": task.stage.id,
+            "name": task.stage.name,
+            "color": task.stage.color,
+            "description": task.stage.description
+        }
+    
+    return TaskSchema(**task_dict)
 
 @router.delete("/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_task(
