@@ -7,4 +7,5 @@ python-jose[cryptography]
 python-dotenv
 requests
 pydantic
+boto3
 
