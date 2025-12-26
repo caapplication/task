@@ -9,6 +9,7 @@ from app.dependencies import get_current_user, get_current_agency
 from app.schemas.task_comment import TaskComment, TaskCommentCreate, TaskCommentUpdate
 from app import crud
 from app.services.storage import save_attachment, get_attachment_url
+from app.crud import crud_task_comment_read
 
 router = APIRouter(prefix="/tasks/{task_id}/comments", tags=["task-comments"])
 
@@ -73,6 +74,55 @@ async def create_task_comment(
             if s3_bucket:
                 comment.attachment_url = f"https://{s3_bucket}.s3.amazonaws.com/{comment.attachment_url}"
     
+    # Emit real-time event for new comment
+    try:
+        from app.socketio_manager import emit_new_comment, emit_unread_update
+        import asyncio
+        
+        # Prepare comment data for emission
+        comment_dict = {
+            "id": str(comment.id),
+            "task_id": str(comment.task_id),
+            "user_id": str(comment.user_id),
+            "message": comment.message,
+            "attachment_url": comment.attachment_url,
+            "attachment_name": comment.attachment_name,
+            "attachment_type": comment.attachment_type,
+            "created_at": comment.created_at.isoformat() if comment.created_at else None,
+        }
+        
+        sender_user_id = str(current_user["id"])
+        
+        # Emit to all users watching this task (except sender)
+        asyncio.create_task(emit_new_comment(str(task_id), comment_dict, sender_user_id))
+        
+        # Update unread status for all users in the task (except sender)
+        # Get all users who should see this task (assigned, collaborators, etc.)
+        from app.crud import crud_task
+        task_obj = crud_task.get_task(db, task_id, current_agency["id"])
+        if task_obj:
+            users_to_notify = set()
+            if task_obj.assigned_to:
+                users_to_notify.add(str(task_obj.assigned_to))
+            if task_obj.created_by:
+                users_to_notify.add(str(task_obj.created_by))
+            
+            # Get collaborators
+            from app.crud import crud_task_collaborator
+            collaborators = crud_task_collaborator.get_task_collaborators(db, task_id)
+            for collab in collaborators:
+                users_to_notify.add(str(collab.user_id))
+            
+            # Remove sender from notification list
+            users_to_notify.discard(sender_user_id)
+            
+            # Emit unread update to all relevant users
+            for user_id in users_to_notify:
+                asyncio.create_task(emit_unread_update(str(task_id), user_id, True))
+    except Exception as e:
+        # Don't fail the request if Socket.IO fails
+        print(f"Socket.IO emission error: {e}")
+    
     return comment
 
 @router.get("/", response_model=List[TaskComment])
@@ -84,7 +134,7 @@ def list_task_comments(
     current_user: dict = Depends(get_current_user),
     current_agency: dict = Depends(get_current_agency),
 ):
-    """Get all comments for a task"""
+    """Get all comments for a task and mark them as read for the current user"""
     # Verify task exists and belongs to agency
     from app import crud as crud_module
     task = crud_module.crud_task.get_task(db, task_id, current_agency["id"])
@@ -97,6 +147,10 @@ def list_task_comments(
         skip=skip,
         limit=limit
     )
+    
+    # Mark all comments as read for the current user when they view the chat
+    user_id = UUID(current_user["id"])
+    crud_task_comment_read.mark_all_comments_as_read(db, task_id, user_id)
     
     # Generate presigned URLs for attachments
     s3_bucket = os.getenv('S3_BUCKET_NAME', '')

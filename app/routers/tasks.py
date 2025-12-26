@@ -8,7 +8,7 @@ import os
 
 from fastapi import Request
 from app.dependencies import get_current_user, get_current_agency, require_role
-from app.crud import crud_task, crud_task_subtask, crud_task_timer, crud_activity_log, crud_task_collaborator
+from app.crud import crud_task, crud_task_subtask, crud_task_timer, crud_activity_log, crud_task_collaborator, crud_task_comment_read
 from app.schemas.task import TaskCreate, TaskUpdate, Task, TaskListItem
 from app.schemas.task_subtask import TaskSubtaskCreate, TaskSubtaskUpdate, TaskSubtask
 from app.schemas.task_timer import TaskTimer, ManualTimeEntry
@@ -225,7 +225,18 @@ def list_tasks(
     
     # Serialize tasks with stage information for Kanban view
     task_list = []
+    current_user_id = UUID(current_user["id"]) if current_user.get("id") else None
+    
     for task in tasks:
+        # Check if user has unread messages for this task
+        has_unread = False
+        if current_user_id:
+            has_unread = crud_task_comment_read.has_unread_comments(
+                db=db,
+                task_id=task.id,
+                user_id=current_user_id
+            )
+        
         task_dict = {
             "id": task.id,
             "task_number": task.task_number,
@@ -247,6 +258,7 @@ def list_tasks(
             "updated_by_role": task.updated_by_role,
             "created_at": task.created_at,
             "updated_at": task.updated_at,
+            "has_unread_messages": has_unread,
         }
         
         # Include stage object if loaded

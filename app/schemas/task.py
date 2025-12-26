@@ -102,6 +102,7 @@ class Task(TaskBase):
         populate_by_name = True
 
 class TaskListItem(BaseModel):
+    has_unread_messages: Optional[bool] = False  # Indicates if user has unread messages
     """Lightweight schema for list views"""
     id: UUID
     task_number: Optional[int] = None  # Sequential task number (T.ID)
