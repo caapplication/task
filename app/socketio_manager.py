@@ -57,6 +57,23 @@ async def emit_unread_update(task_id: str, user_id: str, has_unread: bool):
                 'has_unread': has_unread
             }, room=socket_id)
 
+async def emit_comment_read_receipt(task_id: str, comment_id: str, receipt_data: dict):
+    """Emit read receipt update for a comment to all users watching this task"""
+    if not sio:
+        return
+    
+    task_id_str = str(task_id)
+    if task_id_str in task_rooms:
+        for user_id in task_rooms[task_id_str]:
+            # Send to all socket connections for each user in the task room
+            if user_id in user_connections:
+                for socket_id in user_connections[user_id]:
+                    await sio.emit('comment_read_receipt', {
+                        'task_id': task_id_str,
+                        'comment_id': str(comment_id),
+                        'receipt': receipt_data
+                    }, room=socket_id)
+
 async def register_user_connection(user_id: str, socket_id: str):
     """Register a user's socket connection"""
     if user_id not in user_connections:

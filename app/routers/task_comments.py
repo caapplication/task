@@ -149,7 +149,66 @@ def list_task_comments(
     
     # Mark all comments as read for the current user when they view the chat
     user_id = UUID(current_user["id"])
-    crud_task_comment_read.mark_all_comments_as_read(db, task_id, user_id)
+    # Store user name for display
+    user_name = current_user.get("name") or current_user.get("email") or None
+    
+    # Get all comments for this task before marking as read
+    from app.models.task_comment import TaskComment
+    from app.models.task_comment_read import TaskCommentRead
+    from sqlalchemy import and_
+    from datetime import datetime, timezone
+    
+    comment_ids = db.query(TaskComment.id).filter(
+        TaskComment.task_id == task_id
+    ).all()
+    comment_id_list = [c[0] for c in comment_ids]
+    
+    # Get already read comment IDs before marking
+    already_read = db.query(TaskCommentRead.comment_id).filter(
+        and_(
+            TaskCommentRead.comment_id.in_(comment_id_list),
+            TaskCommentRead.user_id == user_id
+        )
+    ).all()
+    already_read_ids = {r[0] for r in already_read}
+    
+    # Mark all comments as read
+    new_reads_count = crud_task_comment_read.mark_all_comments_as_read(db, task_id, user_id, user_name)
+    
+    # Emit read receipt updates for all newly read comments
+    if new_reads_count > 0:
+        try:
+            from app.socketio_manager import emit_comment_read_receipt
+            import asyncio
+            
+            # Get the comment IDs that were newly marked as read
+            newly_marked_ids = [cid for cid in comment_id_list if cid not in already_read_ids]
+            
+            # Get the read receipts for newly marked comments (already committed in mark_all_comments_as_read)
+            recent_reads = db.query(TaskCommentRead).filter(
+                and_(
+                    TaskCommentRead.comment_id.in_(newly_marked_ids),
+                    TaskCommentRead.user_id == user_id
+                )
+            ).all()
+            
+            # Emit read receipt for each newly marked comment
+            for read_receipt in recent_reads:
+                receipt_data = {
+                    "id": str(read_receipt.id),
+                    "user_id": str(read_receipt.user_id),
+                    "read_at": read_receipt.read_at.isoformat() if read_receipt.read_at else None,
+                    "user_name": read_receipt.user_name or user_name or "Unknown",
+                    "user_email": current_user.get("email") or "N/A"
+                }
+                asyncio.create_task(emit_comment_read_receipt(
+                    str(task_id), 
+                    str(read_receipt.comment_id), 
+                    receipt_data
+                ))
+        except Exception as e:
+            # Don't fail the request if Socket.IO fails
+            print(f"Socket.IO read receipt emission error: {e}")
     
     # Generate presigned URLs for attachments
     s3_bucket = os.getenv('S3_BUCKET_NAME', '')
@@ -245,35 +304,38 @@ def get_comment_read_receipts(
         raise HTTPException(status_code=404, detail="Comment not found")
     
     # Get all read receipts for this comment
-    from sqlalchemy.orm import joinedload
     from app.models.task_comment_read import TaskCommentRead
     
     read_receipts = db.query(TaskCommentRead).filter(
         TaskCommentRead.comment_id == comment_id
     ).order_by(TaskCommentRead.read_at.desc()).all()
     
-    # Fetch user info for each read receipt
+    # Build response using stored user_name, fallback to fetching if needed
     from app.routers.tasks import fetch_user_info_from_login_service
     import os
-    # Get token from environment or use None (function will handle it)
     token_str = os.getenv("INTERNAL_SERVICE_TOKEN", None)
     
     receipts_with_user_info = []
     for receipt in read_receipts:
-        # Try to get user info from login service
-        user_name = "Unknown"
+        # user_name field stores user name
+        user_name = receipt.user_name or "Unknown"
         user_email = "N/A"
         user_role = "N/A"
         
-        try:
-            user_info = fetch_user_info_from_login_service(receipt.user_id, token_str)
-            if user_info:
-                user_name = user_info.get("name") or "Unknown"
-                user_email = user_info.get("email") or "N/A"
-                user_role = user_info.get("role") or "N/A"
-        except Exception as e:
-            # If we can't fetch user info, use defaults
-            print(f"Error fetching user info for {receipt.user_id}: {e}")
+        # Only fetch from login service if name is not stored
+        if not receipt.user_name:
+            try:
+                user_info = fetch_user_info_from_login_service(receipt.user_id, token_str)
+                if user_info:
+                    user_name = user_info.get("name") or user_info.get("email") or "Unknown"
+                    user_email = user_info.get("email") or "N/A"
+                    user_role = user_info.get("role") or "N/A"
+                    # Update the stored name for future use
+                    receipt.user_name = user_name
+                    db.commit()
+            except Exception as e:
+                # If we can't fetch user info, use defaults
+                print(f"Error fetching user info for {receipt.user_id}: {e}")
         
         receipts_with_user_info.append({
             "id": str(receipt.id),

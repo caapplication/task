@@ -11,7 +11,8 @@ from app.schemas.task_comment_read import TaskCommentReadCreate
 def mark_comment_as_read(
     db: Session,
     comment_id: UUID,
-    user_id: UUID
+    user_id: UUID,
+    user_name: Optional[str] = None
 ) -> TaskCommentRead:
     """Mark a comment as read by a user"""
     # Check if already read
@@ -23,12 +24,18 @@ def mark_comment_as_read(
     ).first()
     
     if existing_read:
+        # Update user_name if provided and not already set
+        if user_name and not existing_read.user_name:
+            existing_read.user_name = user_name
+            db.commit()
+            db.refresh(existing_read)
         return existing_read
     
     # Create new read record
     db_read = TaskCommentRead(
         comment_id=comment_id,
-        user_id=user_id
+        user_id=user_id,
+        user_name=user_name
     )
     db.add(db_read)
     db.commit()
@@ -39,7 +46,8 @@ def mark_comment_as_read(
 def mark_all_comments_as_read(
     db: Session,
     task_id: UUID,
-    user_id: UUID
+    user_id: UUID,
+    user_name: Optional[str] = None
 ) -> int:
     """Mark all comments for a task as read by a user"""
     # Get all comment IDs for this task
@@ -53,14 +61,22 @@ def mark_all_comments_as_read(
     comment_id_list = [c[0] for c in comment_ids]
     
     # Get already read comments
-    already_read = db.query(TaskCommentRead.comment_id).filter(
+    already_read = db.query(TaskCommentRead).filter(
         and_(
             TaskCommentRead.comment_id.in_(comment_id_list),
             TaskCommentRead.user_id == user_id
         )
     ).all()
     
-    already_read_ids = {r[0] for r in already_read}
+    already_read_ids = {r.comment_id for r in already_read}
+    
+    # Update user_name for existing reads if provided and not already set
+    if user_name:
+        for read_record in already_read:
+            if not read_record.user_name:
+                read_record.user_name = user_name
+        if already_read:
+            db.commit()
     
     # Create read records for unread comments
     new_reads = []
@@ -68,7 +84,8 @@ def mark_all_comments_as_read(
         if comment_id not in already_read_ids:
             new_reads.append(TaskCommentRead(
                 comment_id=comment_id,
-                user_id=user_id
+                user_id=user_id,
+                user_name=user_name
             ))
     
     if new_reads:
