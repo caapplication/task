@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, func
 from uuid import UUID
 from datetime import datetime
 from typing import List, Optional, Any, Dict
@@ -19,6 +19,16 @@ def convert_uuid_to_str(obj: Any) -> Any:
         return [convert_uuid_to_str(item) for item in obj]
     return obj
 
+def get_next_task_number(db: Session, agency_id: UUID) -> int:
+    """Get the next sequential task number for an agency"""
+    max_task_number = db.query(func.max(Task.task_number)).filter(
+        Task.agency_id == agency_id
+    ).scalar()
+    if max_task_number is None:
+        return 1
+    return max_task_number + 1
+
+
 def create_task(db: Session, task: TaskCreate, agency_id: UUID, user_id: UUID) -> Task:
     # Exclude recurring task fields and JSON fields from task_data
     task_data = task.model_dump(exclude={
@@ -33,10 +43,15 @@ def create_task(db: Session, task: TaskCreate, agency_id: UUID, user_id: UUID) -
     document_request = convert_uuid_to_str(task.document_request.model_dump()) if task.document_request else None
     checklist = convert_uuid_to_str(task.checklist.model_dump()) if task.checklist else None
     
+    # Get next task number
+    task_number = get_next_task_number(db, agency_id)
+    
     db_task = Task(
         **task_data,
         agency_id=agency_id,
+        task_number=task_number,
         created_by=user_id,
+        created_by_name=None,  # Will be set by router with user context
         document_request=document_request,
         checklist=checklist,
         status=TaskStatus.pending
@@ -76,8 +91,12 @@ def get_tasks_by_agency(
     assigned_to: Optional[UUID] = None,
     status: Optional[TaskStatus] = None,
     skip: int = 0,
-    limit: int = 100
+    limit: int = 100,
+    user_id: Optional[UUID] = None  # Include tasks where user is a collaborator
 ) -> List[Task]:
+    from app.models.task_collaborator import TaskCollaborator
+    from sqlalchemy import or_
+    
     query = db.query(Task).options(
         joinedload(Task.stage)  # Load stage relationship for Kanban view
     ).filter(Task.agency_id == agency_id)
@@ -88,6 +107,16 @@ def get_tasks_by_agency(
         query = query.filter(Task.assigned_to == assigned_to)
     if status:
         query = query.filter(Task.status == status)
+    
+    # If user_id is provided, include tasks where user is assigned OR is a collaborator OR user created the task
+    # This ensures users see tasks they're involved with, but we don't restrict to only those
+    # The collaborator feature adds visibility, it doesn't restrict it
+    # Note: We show all tasks by default - collaborators can see tasks they're added to
+    # This filter is only applied when explicitly needed (e.g., "My Tasks" view)
+    if user_id and assigned_to is None:
+        # Only apply collaborator filter if we want to show user's tasks
+        # For now, show all tasks - collaborators will see tasks they're added to via access control
+        pass  # Removed filter to show all tasks
     
     return query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
 
@@ -180,6 +209,9 @@ def update_task(
                 })
                 setattr(db_task, key, value)
     
+    # Set updated_by and updated_at
+    db_task.updated_by = user_id
+    db_task.updated_by_name = None  # Will be set by router with user context
     db_task.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(db_task)

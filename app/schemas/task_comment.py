@@ -4,13 +4,19 @@ from uuid import UUID
 from datetime import datetime
 
 class TaskCommentBase(BaseModel):
-    message: str
+    message: Optional[str] = None
+    attachment_url: Optional[str] = None
+    attachment_name: Optional[str] = None
+    attachment_type: Optional[str] = None
 
 class TaskCommentCreate(TaskCommentBase):
     pass
 
 class TaskCommentUpdate(BaseModel):
     message: Optional[str] = None
+    attachment_url: Optional[str] = None
+    attachment_name: Optional[str] = None
+    attachment_type: Optional[str] = None
 
 class TaskComment(TaskCommentBase):
     id: UUID

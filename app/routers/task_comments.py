@@ -1,36 +1,129 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Form, File, UploadFile
 from sqlalchemy.orm import Session
 from uuid import UUID
-from typing import List
+from typing import List, Optional
+import os
 
 from app.database import get_db
 from app.dependencies import get_current_user, get_current_agency
 from app.schemas.task_comment import TaskComment, TaskCommentCreate, TaskCommentUpdate
 from app import crud
+from app.services.storage import save_attachment, get_attachment_url
+from app.crud import crud_task_comment_read
 
 router = APIRouter(prefix="/tasks/{task_id}/comments", tags=["task-comments"])
 
 @router.post("/", response_model=TaskComment, status_code=status.HTTP_201_CREATED)
-def create_task_comment(
+async def create_task_comment(
     task_id: UUID,
-    comment: TaskCommentCreate,
+    message: Optional[str] = Form(None),
+    attachment: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     current_agency: dict = Depends(get_current_agency),
 ):
-    """Create a new comment on a task"""
+    """Create a new comment on a task with optional file attachment"""
     # Verify task exists and belongs to agency
     from app import crud as crud_module
     task = crud_module.crud_task.get_task(db, task_id, current_agency["id"])
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
-    return crud.crud_task_comment.create_task_comment(
+    # Validate that at least message or attachment is provided
+    if not message and not attachment:
+        raise HTTPException(status_code=400, detail="Either message or attachment must be provided")
+    
+    # Handle file upload if provided
+    attachment_url = None
+    attachment_name = None
+    attachment_type = None
+    if attachment and attachment.filename:
+        try:
+            file_key = save_attachment(attachment, f"task_comments/{task_id}")
+            attachment_url = file_key
+            attachment_name = attachment.filename
+            attachment_type = attachment.content_type or "application/octet-stream"
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to upload attachment: {str(e)}")
+    
+    # Create comment data
+    comment_data = TaskCommentCreate(
+        message=message or "",
+        attachment_url=attachment_url,
+        attachment_name=attachment_name,
+        attachment_type=attachment_type
+    )
+    
+    comment = crud.crud_task_comment.create_task_comment(
         db=db,
-        comment=comment,
+        comment=comment_data,
         task_id=task_id,
         user_id=UUID(current_user["id"])
     )
+    
+    # Generate presigned URL for attachment if exists
+    if comment.attachment_url:
+        try:
+            presigned_url = get_attachment_url(comment.attachment_url, expiration=3600 * 24 * 7)  # 7 days
+            if presigned_url:
+                # Update the comment object with presigned URL for response
+                comment.attachment_url = presigned_url
+        except Exception:
+            # Fallback to S3 public URL if presigned URL generation fails
+            s3_bucket = os.getenv('S3_BUCKET_NAME', '')
+            if s3_bucket:
+                comment.attachment_url = f"https://{s3_bucket}.s3.amazonaws.com/{comment.attachment_url}"
+    
+    # Emit real-time event for new comment
+    try:
+        from app.socketio_manager import emit_new_comment, emit_unread_update
+        import asyncio
+        
+        # Prepare comment data for emission
+        comment_dict = {
+            "id": str(comment.id),
+            "task_id": str(comment.task_id),
+            "user_id": str(comment.user_id),
+            "message": comment.message,
+            "attachment_url": comment.attachment_url,
+            "attachment_name": comment.attachment_name,
+            "attachment_type": comment.attachment_type,
+            "created_at": comment.created_at.isoformat() if comment.created_at else None,
+        }
+        
+        sender_user_id = str(current_user["id"])
+        
+        # Emit to all users watching this task (except sender)
+        asyncio.create_task(emit_new_comment(str(task_id), comment_dict, sender_user_id))
+        
+        # Update unread status for all users in the task (except sender)
+        # Get all users who should see this task (assigned, collaborators, etc.)
+        from app.crud import crud_task
+        task_obj = crud_task.get_task(db, task_id, current_agency["id"])
+        if task_obj:
+            users_to_notify = set()
+            if task_obj.assigned_to:
+                users_to_notify.add(str(task_obj.assigned_to))
+            if task_obj.created_by:
+                users_to_notify.add(str(task_obj.created_by))
+            
+            # Get collaborators
+            from app.crud import crud_task_collaborator
+            collaborators = crud_task_collaborator.get_task_collaborators(db, task_id)
+            for collab in collaborators:
+                users_to_notify.add(str(collab.user_id))
+            
+            # Remove sender from notification list
+            users_to_notify.discard(sender_user_id)
+            
+            # Emit unread update to all relevant users
+            for user_id in users_to_notify:
+                asyncio.create_task(emit_unread_update(str(task_id), user_id, True))
+    except Exception as e:
+        # Don't fail the request if Socket.IO fails
+        print(f"Socket.IO emission error: {e}")
+    
+    return comment
 
 @router.get("/", response_model=List[TaskComment])
 def list_task_comments(
@@ -41,19 +134,40 @@ def list_task_comments(
     current_user: dict = Depends(get_current_user),
     current_agency: dict = Depends(get_current_agency),
 ):
-    """Get all comments for a task"""
+    """Get all comments for a task and mark them as read for the current user"""
     # Verify task exists and belongs to agency
     from app import crud as crud_module
     task = crud_module.crud_task.get_task(db, task_id, current_agency["id"])
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
-    return crud.crud_task_comment.get_task_comments(
+    comments = crud.crud_task_comment.get_task_comments(
         db=db,
         task_id=task_id,
         skip=skip,
         limit=limit
     )
+    
+    # Mark all comments as read for the current user when they view the chat
+    user_id = UUID(current_user["id"])
+    crud_task_comment_read.mark_all_comments_as_read(db, task_id, user_id)
+    
+    # Generate presigned URLs for attachments
+    s3_bucket = os.getenv('S3_BUCKET_NAME', '')
+    for comment in comments:
+        if comment.attachment_url:
+            try:
+                presigned_url = get_attachment_url(comment.attachment_url, expiration=3600 * 24 * 7)  # 7 days
+                if presigned_url:
+                    comment.attachment_url = presigned_url
+                elif s3_bucket:
+                    comment.attachment_url = f"https://{s3_bucket}.s3.amazonaws.com/{comment.attachment_url}"
+            except Exception:
+                # Fallback to S3 public URL if presigned URL generation fails
+                if s3_bucket:
+                    comment.attachment_url = f"https://{s3_bucket}.s3.amazonaws.com/{comment.attachment_url}"
+    
+    return comments
 
 @router.patch("/{comment_id}", response_model=TaskComment)
 def update_task_comment(

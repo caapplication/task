@@ -49,6 +49,7 @@ class TaskBase(BaseModel):
     description: Optional[str] = None
     stage_id: Optional[UUID] = None  # New custom stage support
     due_date: Optional[date] = None
+    due_time: Optional[str] = None  # Time for due date (HH:mm format)
     target_date: Optional[date] = None
     priority: Optional[TaskPriority] = None
     tag_id: Optional[UUID] = None
@@ -81,23 +82,30 @@ class TaskUpdate(BaseModel):
 
 class Task(TaskBase):
     id: UUID
+    task_number: Optional[int] = None  # Sequential task number (T.ID)
     agency_id: UUID
     status: TaskStatus
     created_by: UUID
+    created_by_name: Optional[str] = None  # Creator's name
+    updated_by: Optional[UUID] = None  # Track who last updated the task
+    updated_by_name: Optional[str] = None  # Updater's name
     created_at: datetime
     updated_at: datetime
     total_logged_seconds: Optional[int] = 0
     is_timer_running_for_me: Optional[bool] = False
     subtasks: Optional[List[dict]] = []  # Serialized as dict from router
     stage: Optional[dict] = None  # Stage object when loaded
+    collaborators: Optional[List[dict]] = []  # Collaborators list
 
     class Config:
         from_attributes = True
         populate_by_name = True
 
 class TaskListItem(BaseModel):
+    has_unread_messages: Optional[bool] = False  # Indicates if user has unread messages
     """Lightweight schema for list views"""
     id: UUID
+    task_number: Optional[int] = None  # Sequential task number (T.ID)
     title: str
     client_id: Optional[UUID] = None
     service_id: Optional[UUID] = None
@@ -105,9 +113,17 @@ class TaskListItem(BaseModel):
     stage_id: Optional[UUID] = None  # Add stage_id for Kanban view
     priority: Optional[TaskPriority] = None
     due_date: Optional[date] = None
+    due_time: Optional[str] = None  # Time for due date (HH:mm format)
     assigned_to: Optional[UUID] = None
     tag_id: Optional[UUID] = None
+    created_by: UUID
+    created_by_name: Optional[str] = None  # Creator's name
+    created_by_role: Optional[str] = None  # Creator's role
+    updated_by: Optional[UUID] = None  # Track who last updated the task
+    updated_by_name: Optional[str] = None  # Updater's name
+    updated_by_role: Optional[str] = None  # Updater's role
     created_at: datetime
+    updated_at: datetime
     stage: Optional[dict] = None  # Add stage object for Kanban view
 
     class Config:

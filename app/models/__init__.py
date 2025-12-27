@@ -6,6 +6,8 @@ from .activity_log import ActivityLog
 from .recurring_task import RecurringTask
 from .task_stage import TaskStage
 from .task_comment import TaskComment
+from .task_collaborator import TaskCollaborator
+from .task_comment_read import TaskCommentRead
 
-__all__ = ["Task", "Todo", "TaskSubtask", "TaskTimer", "ActivityLog", "RecurringTask", "TaskStage", "TaskComment"]
+__all__ = ["Task", "Todo", "TaskSubtask", "TaskTimer", "ActivityLog", "RecurringTask", "TaskStage", "TaskComment", "TaskCollaborator", "TaskCommentRead"]
 

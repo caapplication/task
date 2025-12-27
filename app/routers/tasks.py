@@ -1,26 +1,57 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi.security import HTTPBearer
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from uuid import UUID
+import requests
+import os
 
 from fastapi import Request
 from app.dependencies import get_current_user, get_current_agency, require_role
-from app.crud import crud_task, crud_task_subtask, crud_task_timer, crud_activity_log
+from app.crud import crud_task, crud_task_subtask, crud_task_timer, crud_activity_log, crud_task_collaborator, crud_task_comment_read
 from app.schemas.task import TaskCreate, TaskUpdate, Task, TaskListItem
 from app.schemas.task_subtask import TaskSubtaskCreate, TaskSubtaskUpdate, TaskSubtask
 from app.schemas.task_timer import TaskTimer, ManualTimeEntry
 from app.schemas.activity_log import ActivityLog
+from app.schemas.task_collaborator import TaskCollaborator, TaskCollaboratorCreate
 from app.models.task import TaskStatus
+from app import config
 
 router = APIRouter()
+http_bearer = HTTPBearer()
 
 def get_db(request: Request):
     return request.state.db
+
+def fetch_user_info_from_login_service(user_id: UUID, token: str = None) -> dict:
+    """Fetch user name and role from Login service"""
+    try:
+        login_service_url = config.API_URL or os.getenv("API_URL", "http://127.0.0.1:8001")
+        headers = {
+            "accept": "application/json",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        
+        # Call profile endpoint to get user info
+        profile_url = f"{login_service_url}/profile/" if not login_service_url.endswith('/') else f"{login_service_url}profile/"
+        response = requests.get(profile_url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            user_data = response.json()
+            return {
+                "name": user_data.get("name") or user_data.get("email", "Unknown"),
+                "role": user_data.get("role") or "N/A"
+            }
+        return {"name": None, "role": None}
+    except Exception as e:
+        print(f"Error fetching user info from Login service: {e}")
+        return {"name": None, "role": None}
 
 @router.post("/", response_model=Task, status_code=status.HTTP_201_CREATED)
 def create_task(
     task: TaskCreate,
     db: Session = Depends(get_db),
+    token: str = Depends(http_bearer),
     current_user: dict = Depends(get_current_user),
     current_agency: dict = Depends(get_current_agency),
 ):
@@ -36,6 +67,17 @@ def create_task(
             agency_id=current_agency["id"],
             user_id=UUID(current_user["id"])
         )
+        
+        # Fetch creator's name and role from Login service
+        token_str = token.credentials if hasattr(token, 'credentials') else None
+        creator_info = fetch_user_info_from_login_service(
+            UUID(current_user["id"]), 
+            token_str
+        )
+        db_task.created_by_name = creator_info.get("name") or current_user.get("name") or current_user.get("email", "Unknown")
+        db_task.created_by_role = creator_info.get("role") or current_user.get("role") or "N/A"
+        db.commit()
+        db.refresh(db_task)
         
         # If this is a recurring task, create the recurring task template
         if task.is_recurring and task.recurrence_frequency and task.recurrence_start_date:
@@ -93,6 +135,7 @@ def create_task(
         
         task_dict = {
             "id": db_task.id,
+            "task_number": db_task.task_number,
             "agency_id": db_task.agency_id,
             "client_id": db_task.client_id,
             "service_id": db_task.service_id,
@@ -102,12 +145,18 @@ def create_task(
             "stage_id": db_task.stage_id,
             "priority": db_task.priority,
             "due_date": db_task.due_date,
+            "due_time": db_task.due_time,
             "target_date": db_task.target_date,
             "assigned_to": db_task.assigned_to,
             "tag_id": db_task.tag_id,
             "document_request": db_task.document_request,
             "checklist": db_task.checklist,
             "created_by": db_task.created_by,
+            "created_by_name": db_task.created_by_name,
+            "created_by_role": db_task.created_by_role,
+            "updated_by": db_task.updated_by,
+            "updated_by_name": db_task.updated_by_name,
+            "updated_by_role": db_task.updated_by_role,
             "created_at": db_task.created_at,
             "updated_at": db_task.updated_at,
             "total_logged_seconds": 0,
@@ -160,6 +209,9 @@ def list_tasks(
 ):
     from app.schemas.task import TaskListItem
     
+    # Show all tasks in the agency by default
+    # Collaborators can access tasks they're added to via the task detail endpoint
+    # Don't filter by user_id here - show all tasks for the agency
     tasks = crud_task.get_tasks_by_agency(
         db=db,
         agency_id=current_agency["id"],
@@ -167,14 +219,27 @@ def list_tasks(
         assigned_to=assigned_to,
         status=status,
         skip=skip,
-        limit=limit
+        limit=limit,
+        user_id=None  # Don't filter by user - show all tasks
     )
     
     # Serialize tasks with stage information for Kanban view
     task_list = []
+    current_user_id = UUID(current_user["id"]) if current_user.get("id") else None
+    
     for task in tasks:
+        # Check if user has unread messages for this task
+        has_unread = False
+        if current_user_id:
+            has_unread = crud_task_comment_read.has_unread_comments(
+                db=db,
+                task_id=task.id,
+                user_id=current_user_id
+            )
+        
         task_dict = {
             "id": task.id,
+            "task_number": task.task_number,
             "title": task.title,
             "client_id": task.client_id,
             "service_id": task.service_id,
@@ -182,9 +247,18 @@ def list_tasks(
             "stage_id": task.stage_id,  # Include stage_id
             "priority": task.priority,
             "due_date": task.due_date,
+            "due_time": task.due_time,
             "assigned_to": task.assigned_to,
             "tag_id": task.tag_id,
+            "created_by": task.created_by,
+            "created_by_name": task.created_by_name,
+            "created_by_role": task.created_by_role,
+            "updated_by": task.updated_by,
+            "updated_by_name": task.updated_by_name,
+            "updated_by_role": task.updated_by_role,
             "created_at": task.created_at,
+            "updated_at": task.updated_at,
+            "has_unread_messages": has_unread,
         }
         
         # Include stage object if loaded
@@ -208,10 +282,18 @@ def get_task(
     current_agency: dict = Depends(get_current_agency),
 ):
     from app.models.task_timer import TaskTimer
+    from app.models.task import Task
+    from sqlalchemy.orm import joinedload
     from datetime import datetime, timezone
     from app.schemas.task import Task as TaskSchema
     
-    task = crud_task.get_task(db=db, task_id=task_id, agency_id=current_agency["id"])
+    # Load task with collaborators relationship
+    task = db.query(Task).options(
+        joinedload(Task.collaborators)
+    ).filter(
+        Task.id == task_id,
+        Task.agency_id == current_agency["id"]
+    ).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
@@ -262,6 +344,7 @@ def get_task(
     
     task_dict = {
         "id": task.id,
+        "task_number": task.task_number,
         "agency_id": task.agency_id,
         "client_id": task.client_id,
         "service_id": task.service_id,
@@ -271,12 +354,18 @@ def get_task(
         "stage_id": task.stage_id,
         "priority": task.priority,
         "due_date": task.due_date,
+        "due_time": task.due_time,
         "target_date": task.target_date,
         "assigned_to": task.assigned_to,
         "tag_id": task.tag_id,
         "document_request": task.document_request,
         "checklist": task.checklist,
         "created_by": task.created_by,
+        "created_by_name": task.created_by_name,
+        "created_by_role": task.created_by_role,
+        "updated_by": task.updated_by,
+        "updated_by_name": task.updated_by_name,
+        "updated_by_role": task.updated_by_role,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
         "total_logged_seconds": total_seconds,
@@ -300,6 +389,7 @@ def update_task(
     task_id: UUID,
     task_update: TaskUpdate,
     db: Session = Depends(get_db),
+    token: str = Depends(http_bearer),
     current_user: dict = Depends(get_current_user),
     current_agency: dict = Depends(get_current_agency),
 ):
@@ -316,6 +406,17 @@ def update_task(
     )
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Fetch updater's name and role from Login service
+    token_str = token.credentials if hasattr(token, 'credentials') else None
+    updater_info = fetch_user_info_from_login_service(
+        UUID(current_user["id"]), 
+        token_str
+    )
+    task.updated_by_name = updater_info.get("name") or current_user.get("name") or current_user.get("email", "Unknown")
+    task.updated_by_role = updater_info.get("role") or current_user.get("role") or "N/A"
+    db.commit()
+    db.refresh(task)
     
     # Reload task with relationships
     db.refresh(task)
@@ -367,6 +468,7 @@ def update_task(
     # Serialize task with stage information
     task_dict = {
         "id": task.id,
+        "task_number": task.task_number,
         "agency_id": task.agency_id,
         "client_id": task.client_id,
         "service_id": task.service_id,
@@ -376,12 +478,18 @@ def update_task(
         "stage_id": task.stage_id,
         "priority": task.priority,
         "due_date": task.due_date,
+        "due_time": task.due_time,
         "target_date": task.target_date,
         "assigned_to": task.assigned_to,
         "tag_id": task.tag_id,
         "document_request": task.document_request,
         "checklist": task.checklist,
         "created_by": task.created_by,
+        "created_by_name": task.created_by_name,
+        "created_by_role": task.created_by_role,
+        "updated_by": task.updated_by,
+        "updated_by_name": task.updated_by_name,
+        "updated_by_role": task.updated_by_role,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
         "total_logged_seconds": total_seconds,
@@ -566,4 +674,75 @@ def delete_subtask(
     )
     if not success:
         raise HTTPException(status_code=404, detail="Subtask not found")
+
+# Collaborator endpoints
+@router.post("/{task_id}/collaborators", response_model=TaskCollaborator, status_code=status.HTTP_201_CREATED)
+def add_task_collaborator(
+    task_id: UUID,
+    collaborator: TaskCollaboratorCreate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    current_agency: dict = Depends(get_current_agency),
+):
+    """Add a collaborator to a task"""
+    # Verify task exists and belongs to agency
+    task = crud_task.get_task(db, task_id, current_agency["id"])
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Don't allow adding the assigned user as collaborator (they're already assigned)
+    if task.assigned_to == collaborator.user_id:
+        raise HTTPException(status_code=400, detail="User is already assigned to this task")
+    
+    # Don't allow adding the creator as collaborator
+    if task.created_by == collaborator.user_id:
+        raise HTTPException(status_code=400, detail="User is the creator of this task")
+    
+    return crud_task_collaborator.add_collaborator(
+        db=db,
+        task_id=task_id,
+        user_id=collaborator.user_id,
+        added_by=UUID(current_user["id"])
+    )
+
+@router.delete("/{task_id}/collaborators/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_task_collaborator(
+    task_id: UUID,
+    user_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    current_agency: dict = Depends(get_current_agency),
+):
+    """Remove a collaborator from a task"""
+    # Verify task exists and belongs to agency
+    task = crud_task.get_task(db, task_id, current_agency["id"])
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    deleted = crud_task_collaborator.remove_collaborator(
+        db=db,
+        task_id=task_id,
+        user_id=user_id,
+        removed_by=UUID(current_user["id"])
+    )
+    
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Collaborator not found")
+    
+    return None
+
+@router.get("/{task_id}/collaborators", response_model=List[TaskCollaborator])
+def get_task_collaborators(
+    task_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    current_agency: dict = Depends(get_current_agency),
+):
+    """Get all collaborators for a task"""
+    # Verify task exists and belongs to agency
+    task = crud_task.get_task(db, task_id, current_agency["id"])
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    return crud_task_collaborator.get_task_collaborators(db=db, task_id=task_id)
 

@@ -18,20 +18,36 @@ def create_task_comment(
     db_comment = TaskComment(
         task_id=task_id,
         user_id=user_id,
-        message=comment.message
+        message=comment.message,
+        attachment_url=comment.attachment_url,
+        attachment_name=comment.attachment_name,
+        attachment_type=comment.attachment_type
     )
     db.add(db_comment)
     db.commit()
     db.refresh(db_comment)
     
     # Create activity log for comment
+    activity_details = ""
+    if comment.message:
+        activity_details = f"Added a comment: {comment.message[:100]}{'...' if len(comment.message) > 100 else ''}"
+    if comment.attachment_url:
+        if activity_details:
+            activity_details += " with attachment"
+        else:
+            activity_details = "Added an attachment"
+    
     activity_log = ActivityLog(
         task_id=task_id,
         user_id=user_id,
         action="Comment added",
-        details=f"Added a comment: {comment.message[:100]}{'...' if len(comment.message) > 100 else ''}",
+        details=activity_details,
         event_type="comment_added",
-        to_value={"comment_id": str(db_comment.id), "message_preview": comment.message[:100]}
+        to_value={
+            "comment_id": str(db_comment.id),
+            "message_preview": comment.message[:100] if comment.message else None,
+            "has_attachment": bool(comment.attachment_url)
+        }
     )
     db.add(activity_log)
     db.commit()
