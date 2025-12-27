@@ -8,12 +8,13 @@ import os
 
 from fastapi import Request
 from app.dependencies import get_current_user, get_current_agency, require_role
-from app.crud import crud_task, crud_task_subtask, crud_task_timer, crud_activity_log, crud_task_collaborator, crud_task_comment_read
+from app.crud import crud_task, crud_task_subtask, crud_task_timer, crud_activity_log, crud_task_collaborator, crud_task_comment_read, crud_task_closure_request
 from app.schemas.task import TaskCreate, TaskUpdate, Task, TaskListItem
 from app.schemas.task_subtask import TaskSubtaskCreate, TaskSubtaskUpdate, TaskSubtask
 from app.schemas.task_timer import TaskTimer, ManualTimeEntry
 from app.schemas.activity_log import ActivityLog
 from app.schemas.task_collaborator import TaskCollaborator, TaskCollaboratorCreate
+from app.schemas.task_closure_request import TaskClosureRequest, TaskClosureRequestCreate, TaskClosureRequestUpdate, ClosureRequestStatus
 from app.models.task import TaskStatus
 from app import config
 
@@ -745,4 +746,192 @@ def get_task_collaborators(
         raise HTTPException(status_code=404, detail="Task not found")
     
     return crud_task_collaborator.get_task_collaborators(db=db, task_id=task_id)
+
+# Task Closure Request Endpoints
+@router.post("/{task_id}/closure-request", response_model=TaskClosureRequest, status_code=status.HTTP_201_CREATED)
+def request_task_closure(
+    task_id: UUID,
+    closure_request: TaskClosureRequestCreate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    current_agency: dict = Depends(get_current_agency),
+):
+    """Request to close a task (can only be done by assigned user)"""
+    # Verify task exists and belongs to agency
+    task = crud_task.get_task(db, task_id, current_agency["id"])
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Check if user is assigned to this task
+    if task.assigned_to != UUID(current_user["id"]):
+        raise HTTPException(
+            status_code=403, 
+            detail="Only the assigned user can request to close this task"
+        )
+    
+    # Check if task is already completed
+    if task.status == TaskStatus.completed:
+        raise HTTPException(
+            status_code=400,
+            detail="Task is already completed"
+        )
+    
+    # Create closure request
+    closure_request.task_id = task_id
+    db_request = crud_task_closure_request.create_closure_request(
+        db=db,
+        closure_request=closure_request,
+        requested_by=UUID(current_user["id"])
+    )
+    
+    # Create activity log
+    crud_activity_log.create_activity_log(
+        db=db,
+        task_id=task_id,
+        action="closure_requested",
+        user_id=UUID(current_user["id"]),
+        details={"request_id": str(db_request.id)}
+    )
+    
+    # Emit notification to task creator (if different from requester)
+    try:
+        from app.socketio_manager import emit_task_notification
+        import asyncio
+        if task.created_by != UUID(current_user["id"]):
+            asyncio.create_task(emit_task_notification(
+                str(task.created_by),
+                {
+                    "type": "closure_request",
+                    "task_id": str(task_id),
+                    "task_title": task.title,
+                    "requested_by": current_user.get("name") or current_user.get("email", "Unknown"),
+                    "request_id": str(db_request.id)
+                }
+            ))
+    except Exception as e:
+        print(f"Socket.IO notification error: {e}")
+    
+    return db_request
+
+@router.patch("/{task_id}/closure-request/{request_id}", response_model=TaskClosureRequest)
+def review_closure_request(
+    task_id: UUID,
+    request_id: UUID,
+    closure_request_update: TaskClosureRequestUpdate,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    current_agency: dict = Depends(get_current_agency),
+):
+    """Approve or reject a closure request (can only be done by task creator)"""
+    # Verify task exists and belongs to agency
+    task = crud_task.get_task(db, task_id, current_agency["id"])
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Check if user is the task creator
+    if task.created_by != UUID(current_user["id"]):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the task creator can approve or reject closure requests"
+        )
+    
+    # Get the closure request
+    db_request = crud_task_closure_request.get_closure_request(db, request_id, task_id)
+    if not db_request:
+        raise HTTPException(status_code=404, detail="Closure request not found")
+    
+    # Check if request is already reviewed
+    if db_request.status != ClosureRequestStatus.pending:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Closure request has already been {db_request.status.value}"
+        )
+    
+    # Update closure request
+    updated_request = crud_task_closure_request.update_closure_request(
+        db=db,
+        request_id=request_id,
+        task_id=task_id,
+        closure_request_update=closure_request_update,
+        reviewed_by=UUID(current_user["id"])
+    )
+    
+    # If approved, update task status to completed
+    if closure_request_update.status == ClosureRequestStatus.approved:
+        from app.schemas.task import TaskUpdate
+        task_update = TaskUpdate(status=TaskStatus.completed)
+        crud_task.update_task(
+            db=db,
+            task_id=task_id,
+            task_update=task_update,
+            agency_id=current_agency["id"],
+            user_id=UUID(current_user["id"])
+        )
+        
+        # Create activity log
+        crud_activity_log.create_activity_log(
+            db=db,
+            task_id=task_id,
+            action="task_closed",
+            user_id=UUID(current_user["id"]),
+            details={"closure_request_id": str(request_id), "approved_by": current_user.get("name") or current_user.get("email", "Unknown")}
+        )
+        
+        # Emit notification to requester
+        try:
+            from app.socketio_manager import emit_task_notification
+            import asyncio
+            asyncio.create_task(emit_task_notification(
+                str(db_request.requested_by),
+                {
+                    "type": "closure_approved",
+                    "task_id": str(task_id),
+                    "task_title": task.title,
+                    "reviewed_by": current_user.get("name") or current_user.get("email", "Unknown")
+                }
+            ))
+        except Exception as e:
+            print(f"Socket.IO notification error: {e}")
+    else:
+        # Create activity log for rejection
+        crud_activity_log.create_activity_log(
+            db=db,
+            task_id=task_id,
+            action="closure_rejected",
+            user_id=UUID(current_user["id"]),
+            details={"closure_request_id": str(request_id), "rejected_by": current_user.get("name") or current_user.get("email", "Unknown")}
+        )
+        
+        # Emit notification to requester
+        try:
+            from app.socketio_manager import emit_task_notification
+            import asyncio
+            asyncio.create_task(emit_task_notification(
+                str(db_request.requested_by),
+                {
+                    "type": "closure_rejected",
+                    "task_id": str(task_id),
+                    "task_title": task.title,
+                    "reviewed_by": current_user.get("name") or current_user.get("email", "Unknown")
+                }
+            ))
+        except Exception as e:
+            print(f"Socket.IO notification error: {e}")
+    
+    return updated_request
+
+@router.get("/{task_id}/closure-request", response_model=Optional[TaskClosureRequest])
+def get_closure_request(
+    task_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    current_agency: dict = Depends(get_current_agency),
+):
+    """Get pending closure request for a task"""
+    # Verify task exists and belongs to agency
+    task = crud_task.get_task(db, task_id, current_agency["id"])
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    return crud_task_closure_request.get_pending_closure_request(db, task_id)
 

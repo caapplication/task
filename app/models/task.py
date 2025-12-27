@@ -54,4 +54,5 @@ class Task(Base):
     activity_logs = relationship("ActivityLog", back_populates="task", cascade="all, delete-orphan", order_by="ActivityLog.created_at.desc()")
     comments = relationship("TaskComment", back_populates="task", cascade="all, delete-orphan", order_by="TaskComment.created_at.asc()")
     collaborators = relationship("TaskCollaborator", back_populates="task", cascade="all, delete-orphan")
+    closure_requests = relationship("TaskClosureRequest", back_populates="task", cascade="all, delete-orphan", order_by="TaskClosureRequest.created_at.desc()")
 

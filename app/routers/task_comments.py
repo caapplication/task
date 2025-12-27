@@ -29,9 +29,8 @@ async def create_task_comment(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
-    # Validate that at least message or attachment is provided
-    if not message and not attachment:
-        raise HTTPException(status_code=400, detail="Either message or attachment must be provided")
+    # Allow empty messages - no validation required
+    # Users can send messages with or without text/attachments
     
     # Handle file upload if provided
     attachment_url = None
@@ -224,4 +223,66 @@ def delete_task_comment(
         raise HTTPException(status_code=404, detail="Comment not found or you don't have permission to delete it")
     
     return None
+
+@router.get("/{comment_id}/reads", response_model=List[dict])
+def get_comment_read_receipts(
+    task_id: UUID,
+    comment_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    current_agency: dict = Depends(get_current_agency),
+):
+    """Get list of users who have read a specific comment"""
+    # Verify task exists
+    from app import crud as crud_module
+    task = crud_module.crud_task.get_task(db, task_id, current_agency["id"])
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Verify comment exists and belongs to task
+    comment = crud.crud_task_comment.get_task_comment(db, comment_id, task_id)
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    
+    # Get all read receipts for this comment
+    from sqlalchemy.orm import joinedload
+    from app.models.task_comment_read import TaskCommentRead
+    
+    read_receipts = db.query(TaskCommentRead).filter(
+        TaskCommentRead.comment_id == comment_id
+    ).order_by(TaskCommentRead.read_at.desc()).all()
+    
+    # Fetch user info for each read receipt
+    from app.routers.tasks import fetch_user_info_from_login_service
+    import os
+    # Get token from environment or use None (function will handle it)
+    token_str = os.getenv("INTERNAL_SERVICE_TOKEN", None)
+    
+    receipts_with_user_info = []
+    for receipt in read_receipts:
+        # Try to get user info from login service
+        user_name = "Unknown"
+        user_email = "N/A"
+        user_role = "N/A"
+        
+        try:
+            user_info = fetch_user_info_from_login_service(receipt.user_id, token_str)
+            if user_info:
+                user_name = user_info.get("name") or "Unknown"
+                user_email = user_info.get("email") or "N/A"
+                user_role = user_info.get("role") or "N/A"
+        except Exception as e:
+            # If we can't fetch user info, use defaults
+            print(f"Error fetching user info for {receipt.user_id}: {e}")
+        
+        receipts_with_user_info.append({
+            "id": str(receipt.id),
+            "user_id": str(receipt.user_id),
+            "read_at": receipt.read_at.isoformat() if receipt.read_at else None,
+            "user_name": user_name,
+            "user_email": user_email,
+            "user_role": user_role
+        })
+    
+    return receipts_with_user_info
 
