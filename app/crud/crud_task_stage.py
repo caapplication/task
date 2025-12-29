@@ -69,8 +69,9 @@ def initialize_default_stages(db: Session, agency_id: UUID, user_id: UUID) -> Li
         {"name": "To Do", "description": "Tasks that need to be started", "color": "#3b82f6", "sort_order": 0, "is_completed": False, "is_blocked": False},
         {"name": "In Progress", "description": "Tasks currently being worked on", "color": "#f59e0b", "sort_order": 1, "is_completed": False, "is_blocked": False},
         {"name": "Need Review", "description": "Tasks waiting for review", "color": "#8b5cf6", "sort_order": 2, "is_completed": False, "is_blocked": False},
-        {"name": "Complete", "description": "Completed tasks", "color": "#10b981", "sort_order": 3, "is_completed": True, "is_blocked": False},
-        {"name": "Blocked", "description": "Tasks that are blocked", "color": "#ef4444", "sort_order": 4, "is_completed": False, "is_blocked": True},
+        {"name": "On Hold", "description": "Tasks that are temporarily paused", "color": "#fbbf24", "sort_order": 3, "is_completed": False, "is_blocked": False},
+        {"name": "Complete", "description": "Completed tasks", "color": "#10b981", "sort_order": 4, "is_completed": True, "is_blocked": False},
+        {"name": "Blocked", "description": "Tasks that are blocked", "color": "#ef4444", "sort_order": 5, "is_completed": False, "is_blocked": True},
     ]
     
     created_stages = []
