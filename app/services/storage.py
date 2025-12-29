@@ -58,15 +58,33 @@ def save_attachment(file: UploadFile, path_prefix: str) -> str:
         raise Exception(f"Failed to upload to S3: {str(e)}")
 
 
-def get_attachment_url(file_key: str, expiration: int = 3600):
-    """Generates a presigned URL for an S3 object."""
+def get_attachment_url(file_key: str, expiration: int = 3600, inline: bool = True):
+    """Generates a presigned URL for an S3 object.
+    
+    Args:
+        file_key: The S3 key of the file
+        expiration: URL expiration time in seconds (default: 3600)
+        inline: If True, sets ResponseContentDisposition to 'inline' for previewing.
+                If False, sets it to 'attachment' for downloading (default: True)
+    """
     if not S3_BUCKET_NAME or not file_key:
         return None
     try:
         s3 = get_s3_client()
+        params = {
+            "Bucket": S3_BUCKET_NAME,
+            "Key": file_key
+        }
+        
+        # Set Content-Disposition header to inline for previewing, or attachment for downloading
+        if inline:
+            params["ResponseContentDisposition"] = "inline"
+        else:
+            params["ResponseContentDisposition"] = "attachment"
+        
         url = s3.generate_presigned_url(
             "get_object",
-            Params={"Bucket": S3_BUCKET_NAME, "Key": file_key},
+            Params=params,
             ExpiresIn=expiration,
         )
         return url
