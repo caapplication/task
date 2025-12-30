@@ -2,12 +2,26 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from socketio import ASGIApp
+import logging
+import sys
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 from app.database import get_db
 from app.routers import tasks, todos, recurring_tasks, scheduler, task_stages, task_comments
 from app.socketio_manager import init_socketio
 
 fastapi_app = FastAPI(title="Task Management API", version="1.0.0")
+logger.info("Task Management API starting up...")
 
 # Initialize Socket.IO
 socketio_server = init_socketio(fastapi_app)

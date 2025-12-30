@@ -1,10 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, BackgroundTasks
 from fastapi.security import HTTPBearer
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from uuid import UUID
 import requests
 import os
+import logging
+
+# Set up logger
+logger = logging.getLogger(__name__)
 
 from fastapi import Request
 from app.dependencies import get_current_user, get_current_agency, require_role
@@ -45,8 +49,62 @@ def fetch_user_info_from_login_service(user_id: UUID, token: str = None) -> dict
             }
         return {"name": None, "role": None}
     except Exception as e:
-        print(f"Error fetching user info from Login service: {e}")
+        logger.error(f"Error fetching user info from Login service for user {user_id}: {e}")
         return {"name": None, "role": None}
+
+def fetch_user_email_from_login_service(user_id: UUID, token: str = None) -> Optional[str]:
+    """Fetch user email from Login service by user_id"""
+    try:
+        login_service_url = config.API_URL or os.getenv("API_URL", "http://127.0.0.1:8001")
+        headers = {
+            "accept": "application/json",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        
+        # Try multiple endpoints to get user email
+        # First try: /admin/users/{user_id} (admin endpoint)
+        admin_user_url = f"{login_service_url}/admin/users/{user_id}" if not login_service_url.endswith('/') else f"{login_service_url}admin/users/{user_id}"
+        try:
+            response = requests.get(admin_user_url, headers=headers, timeout=5)
+            if response.status_code == 200:
+                user_data = response.json()
+                logger.debug(f'Fetched user data from admin endpoint: {user_data}')
+                email = user_data.get("email")
+                if email:
+                    logger.info(f"Successfully fetched email for user {user_id} from admin endpoint: {email}")
+                    return email
+                else:
+                    logger.warning(f"Admin endpoint returned user data but no email field for user {user_id}")
+            else:
+                logger.warning(f"Admin endpoint returned status {response.status_code} for user {user_id}: {response.text}")
+        except Exception as e:
+            logger.warning(f"Admin endpoint failed for user {user_id}: {e}")
+        
+        # Second try: /team/team-member/{user_id} (team member endpoint)
+        team_member_url = f"{login_service_url}/team/team-member/{user_id}" if not login_service_url.endswith('/') else f"{login_service_url}team/team-member/{user_id}"
+        try:
+            response = requests.get(team_member_url, headers=headers, timeout=5)
+            if response.status_code == 200:
+                user_data = response.json()
+                logger.debug(f'Fetched user data from team member endpoint: {user_data}')
+                # Handle both dict and object responses
+                if isinstance(user_data, dict):
+                    email = user_data.get("email")
+                else:
+                    email = getattr(user_data, "email", None)
+                if email:
+                    logger.info(f"Successfully fetched email for user {user_id} from team member endpoint: {email}")
+                    return email
+        except Exception as e:
+            logger.debug(f"Team member endpoint failed for user {user_id}: {e}")
+        
+        # If we can't get email, return None (email won't be sent)
+        logger.warning(f"Could not fetch email for user {user_id} from Login service - email notification will be skipped")
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching user email from Login service for user {user_id}: {e}")
+        return None
 
 @router.post("/", response_model=Task, status_code=status.HTTP_201_CREATED)
 def create_task(
@@ -187,11 +245,64 @@ def create_task(
                         "description": stage.description
                     }
         
+        # Send email notifications to assigned user (in background)
+        # Note: Collaborators are added separately, so we'll send email when they're added
+        from app.utils.email import send_task_creation_email
+        import threading
+        
+        # Prepare task details for email
+        creator_name = db_task.created_by_name or current_user.get("name") or current_user.get("email", "Unknown")
+        task_description = db_task.description
+        due_date_str = None
+        if db_task.due_date:
+            due_date_str = db_task.due_date.strftime("%Y-%m-%d")
+            if db_task.due_time:
+                due_date_str += f" at {db_task.due_time}"
+        priority_str = db_task.priority.value if db_task.priority else None
+        
+        # Send email to assigned user (in background thread)
+        if db_task.assigned_to:
+            logger.info(f"Task #{db_task.task_number} created - preparing to send email to assigned user {db_task.assigned_to}")
+            
+            def send_email_to_assigned():
+                try:
+                    logger.debug(f"Fetching email for assigned user {db_task.assigned_to}")
+                    assigned_user_email = fetch_user_email_from_login_service(
+                        db_task.assigned_to,
+                        token_str
+                    )
+                    if assigned_user_email:
+                        logger.info(f"[TASK CREATION] Email address retrieved for assigned user: {assigned_user_email}")
+                        logger.info(f"[TASK CREATION] Initiating email send to: {assigned_user_email}")
+                        logger.info(f"[TASK CREATION] Task details - Number: #{db_task.task_number}, Title: '{db_task.title}', Assigned to: {assigned_user_email}")
+                        result = send_task_creation_email(
+                            to_email=assigned_user_email,
+                            task_title=db_task.title,
+                            task_number=db_task.task_number or 0,
+                            creator_name=creator_name,
+                            task_description=task_description,
+                            due_date=due_date_str,
+                            priority=priority_str
+                        )
+                        if result:
+                            logger.info(f"Successfully sent email to assigned user {assigned_user_email} for task #{db_task.task_number}")
+                        else:
+                            logger.warning(f"Failed to send email to assigned user {assigned_user_email} for task #{db_task.task_number}")
+                    else:
+                        logger.warning(f"Could not fetch email for assigned user {db_task.assigned_to} - email not sent")
+                except Exception as e:
+                    logger.error(f"Error sending email to assigned user {db_task.assigned_to}: {e}", exc_info=True)
+            
+            # Start email sending in background thread
+            email_thread = threading.Thread(target=send_email_to_assigned)
+            email_thread.daemon = True
+            email_thread.start()
+        
         return TaskSchema(**task_dict)
     except Exception as e:
         error_trace = traceback.format_exc()
-        print(f"Error creating task: {str(e)}")
-        print(f"Traceback: {error_trace}")
+        logger.error(f"Error creating task: {str(e)}")
+        logger.error(f"Traceback: {error_trace}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error creating task: {str(e)}. Please check server logs for details."
@@ -682,6 +793,7 @@ def add_task_collaborator(
     task_id: UUID,
     collaborator: TaskCollaboratorCreate,
     db: Session = Depends(get_db),
+    token: str = Depends(http_bearer),
     current_user: dict = Depends(get_current_user),
     current_agency: dict = Depends(get_current_agency),
 ):
@@ -699,12 +811,63 @@ def add_task_collaborator(
     if task.created_by == collaborator.user_id:
         raise HTTPException(status_code=400, detail="User is the creator of this task")
     
-    return crud_task_collaborator.add_collaborator(
+    # Add collaborator
+    db_collaborator = crud_task_collaborator.add_collaborator(
         db=db,
         task_id=task_id,
         user_id=collaborator.user_id,
         added_by=UUID(current_user["id"])
     )
+    
+    # Send email notification to the new collaborator
+    from app.utils.email import send_task_creation_email
+    import threading
+    
+    logger.info(f"Collaborator {collaborator.user_id} added to task #{task.task_number} - preparing to send email notification")
+    
+    def send_email_to_collaborator():
+        try:
+            token_str = token.credentials if hasattr(token, 'credentials') else None
+            logger.debug(f"Fetching email for collaborator {collaborator.user_id}")
+            collaborator_email = fetch_user_email_from_login_service(
+                collaborator.user_id,
+                token_str
+            )
+            if collaborator_email:
+                logger.info(f"Sending task notification email to collaborator: {collaborator_email}")
+                creator_name = task.created_by_name or current_user.get("name") or current_user.get("email", "Unknown")
+                task_description = task.description
+                due_date_str = None
+                if task.due_date:
+                    due_date_str = task.due_date.strftime("%Y-%m-%d")
+                    if task.due_time:
+                        due_date_str += f" at {task.due_time}"
+                priority_str = task.priority.value if task.priority else None
+                
+                result = send_task_creation_email(
+                    to_email=collaborator_email,
+                    task_title=task.title,
+                    task_number=task.task_number or 0,
+                    creator_name=creator_name,
+                    task_description=task_description,
+                    due_date=due_date_str,
+                    priority=priority_str
+                )
+                if result:
+                    logger.info(f"Successfully sent email to collaborator {collaborator_email} for task #{task.task_number}")
+                else:
+                    logger.warning(f"Failed to send email to collaborator {collaborator_email} for task #{task.task_number}")
+            else:
+                logger.warning(f"Could not fetch email for collaborator {collaborator.user_id} - email not sent")
+        except Exception as e:
+            logger.error(f"Error sending email to collaborator {collaborator.user_id}: {e}", exc_info=True)
+    
+    # Start email sending in background thread
+    email_thread = threading.Thread(target=send_email_to_collaborator)
+    email_thread.daemon = True
+    email_thread.start()
+    
+    return db_collaborator
 
 @router.delete("/{task_id}/collaborators/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 def remove_task_collaborator(
@@ -809,7 +972,7 @@ def request_task_closure(
                 }
             ))
     except Exception as e:
-        print(f"Socket.IO notification error: {e}")
+        logger.error(f"Socket.IO notification error: {e}")
     
     return db_request
 
@@ -891,7 +1054,7 @@ def review_closure_request(
                 }
             ))
         except Exception as e:
-            print(f"Socket.IO notification error: {e}")
+            logger.error(f"Socket.IO notification error: {e}")
     else:
         # Create activity log for rejection
         crud_activity_log.create_activity_log(
@@ -916,7 +1079,7 @@ def review_closure_request(
                 }
             ))
         except Exception as e:
-            print(f"Socket.IO notification error: {e}")
+            logger.error(f"Socket.IO notification error: {e}")
     
     return updated_request
 

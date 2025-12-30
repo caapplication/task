@@ -9,4 +9,5 @@ requests
 pydantic
 boto3
 python-socketio[asyncio]
+sib-api-v3-sdk
 

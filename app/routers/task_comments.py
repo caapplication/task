@@ -1,8 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Form, File, UploadFile
+from fastapi.security import HTTPBearer
 from sqlalchemy.orm import Session
 from uuid import UUID
 from typing import List, Optional
 import os
+import logging
+import threading
 
 from app.database import get_db
 from app.dependencies import get_current_user, get_current_agency
@@ -10,6 +13,9 @@ from app.schemas.task_comment import TaskComment, TaskCommentCreate, TaskComment
 from app import crud
 from app.services.storage import save_attachment, get_attachment_url
 from app.crud import crud_task_comment_read
+
+logger = logging.getLogger(__name__)
+http_bearer = HTTPBearer()
 
 router = APIRouter(prefix="/tasks/{task_id}/comments", tags=["task-comments"])
 
@@ -19,6 +25,7 @@ async def create_task_comment(
     message: Optional[str] = Form(None),
     attachment: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
+    token: str = Depends(http_bearer),
     current_user: dict = Depends(get_current_user),
     current_agency: dict = Depends(get_current_agency),
 ):
@@ -73,6 +80,8 @@ async def create_task_comment(
             if s3_bucket:
                 comment.attachment_url = f"https://{s3_bucket}.s3.amazonaws.com/{comment.attachment_url}"
     
+    sender_user_id = str(current_user["id"])
+    
     # Emit real-time event for new comment
     try:
         from app.socketio_manager import emit_new_comment, emit_unread_update
@@ -89,8 +98,6 @@ async def create_task_comment(
             "attachment_type": comment.attachment_type,
             "created_at": comment.created_at.isoformat() if comment.created_at else None,
         }
-        
-        sender_user_id = str(current_user["id"])
         
         # Emit to all users watching this task (except sender)
         asyncio.create_task(emit_new_comment(str(task_id), comment_dict, sender_user_id))
@@ -121,6 +128,98 @@ async def create_task_comment(
     except Exception as e:
         # Don't fail the request if Socket.IO fails
         print(f"Socket.IO emission error: {e}")
+    
+    # Send email notifications for the comment
+    try:
+        from app.utils.email import send_task_comment_email
+        from app.routers.tasks import fetch_user_info_from_login_service, fetch_user_email_from_login_service
+        from app.models.task_comment import TaskComment as TaskCommentModel
+        
+        # Get sender's name
+        token_str = token.credentials if hasattr(token, 'credentials') else None
+        sender_info = fetch_user_info_from_login_service(UUID(current_user["id"]), token_str)
+        sender_name = sender_info.get("name") or current_user.get("name") or current_user.get("email", "Unknown")
+        
+        # Get all previous comments to find who should receive email (for replies)
+        previous_comments = db.query(TaskCommentModel).filter(
+            TaskCommentModel.task_id == task_id,
+            TaskCommentModel.id != comment.id
+        ).order_by(TaskCommentModel.created_at.desc()).all()
+        
+        # Determine who should receive emails
+        users_to_email = set()
+        
+        if previous_comments:
+            # If there are previous comments, this is a reply - send to previous commenters
+            logger.info(f"Previous comments found - treating as reply. Sending email to previous commenters.")
+            for prev_comment in previous_comments:
+                if str(prev_comment.user_id) != sender_user_id:
+                    users_to_email.add(str(prev_comment.user_id))
+        else:
+            # If no previous comments, send to all task participants (first comment)
+            logger.info(f"First comment on task - sending email to all participants.")
+            if task.assigned_to and str(task.assigned_to) != sender_user_id:
+                users_to_email.add(str(task.assigned_to))
+            if task.created_by and str(task.created_by) != sender_user_id:
+                users_to_email.add(str(task.created_by))
+            
+            # Get collaborators
+            from app.crud import crud_task_collaborator
+            collaborators = crud_task_collaborator.get_task_collaborators(db, task_id)
+            for collab in collaborators:
+                if str(collab.user_id) != sender_user_id:
+                    users_to_email.add(str(collab.user_id))
+        
+        # Send emails in background thread
+        def send_comment_emails():
+            try:
+                frontend_url = os.getenv("FRONTEND_URL", "http://localhost:8003")
+                task_url = f"{frontend_url}/tasks"
+                
+                for user_id_str in users_to_email:
+                    try:
+                        user_id = UUID(user_id_str)
+                        logger.info(f"Preparing to send email to user {user_id_str} for comment on task #{task.task_number}")
+                        
+                        recipient_email = fetch_user_email_from_login_service(user_id, token_str)
+                        
+                        if recipient_email:
+                            logger.info(f"Email address retrieved for recipient: {recipient_email}")
+                            
+                            result = send_task_comment_email(
+                                to_email=recipient_email,
+                                sender_name=sender_name,
+                                task_title=task.title,
+                                task_number=task.task_number or 0,
+                                comment_message=message,
+                                has_attachment=bool(attachment_url),
+                                attachment_name=comment.attachment_name,
+                                task_url=task_url
+                            )
+                            
+                            if result:
+                                logger.info(f"Successfully sent email to {recipient_email} for comment on task #{task.task_number}")
+                            else:
+                                logger.warning(f"Failed to send email to {recipient_email} for comment on task #{task.task_number}")
+                        else:
+                            logger.warning(f"Could not fetch email for user {user_id_str} - email not sent")
+                    except Exception as e:
+                        logger.error(f"Error sending email to user {user_id_str}: {e}", exc_info=True)
+            except Exception as e:
+                logger.error(f"Error in email sending thread: {e}", exc_info=True)
+        
+        # Start email sending in background thread
+        if users_to_email:
+            logger.info(f"Sending email notifications to {len(users_to_email)} recipient(s) for comment on task #{task.task_number}")
+            email_thread = threading.Thread(target=send_comment_emails)
+            email_thread.daemon = True
+            email_thread.start()
+        else:
+            logger.info(f"No recipients to email for comment on task #{task.task_number}")
+    
+    except Exception as e:
+        # Don't fail the request if email sending fails
+        logger.error(f"Error setting up email notifications: {e}", exc_info=True)
     
     return comment
 
