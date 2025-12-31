@@ -1,9 +1,17 @@
 from __future__ import print_function
-import sib_api_v3_sdk
-from sib_api_v3_sdk.rest import ApiException
 from dotenv import load_dotenv
 import os
 import logging
+
+# Try to import email SDK, but don't fail if it's not installed
+try:
+    import sib_api_v3_sdk
+    from sib_api_v3_sdk.rest import ApiException
+    EMAIL_SDK_AVAILABLE = True
+except ImportError:
+    EMAIL_SDK_AVAILABLE = False
+    sib_api_v3_sdk = None
+    ApiException = Exception  # Fallback to base Exception class
 
 # Set up logger
 logger = logging.getLogger(__name__)
@@ -13,6 +21,10 @@ load_dotenv()
 def send_task_creation_email(to_email: str, task_title: str, task_number: int, creator_name: str, task_description: str = None, due_date: str = None, priority: str = None):
     """Send email notification when a task is created"""
     logger.info(f"Attempting to send task creation email to {to_email} for task #{task_number}: {task_title}")
+    
+    if not EMAIL_SDK_AVAILABLE:
+        logger.warning("Email SDK (sib_api_v3_sdk) not installed - email sending disabled")
+        return False
     
     try:
         API_KEY = os.getenv("SENDINBLUE_API_KEY") or os.getenv("API_KEY")
@@ -133,6 +145,10 @@ def send_task_creation_email(to_email: str, task_title: str, task_number: int, c
 def send_task_comment_email(to_email: str, sender_name: str, task_title: str, task_number: int, comment_message: str = None, has_attachment: bool = False, attachment_name: str = None, task_url: str = None):
     """Send email notification when a comment is added to a task"""
     logger.info(f"Attempting to send task comment email to {to_email} for task #{task_number}: {task_title}")
+    
+    if not EMAIL_SDK_AVAILABLE:
+        logger.warning("Email SDK (sib_api_v3_sdk) not installed - email sending disabled")
+        return False
     
     try:
         API_KEY = os.getenv("SENDINBLUE_API_KEY") or os.getenv("API_KEY")

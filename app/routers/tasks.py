@@ -220,7 +220,15 @@ def create_task(
             "updated_at": db_task.updated_at,
             "total_logged_seconds": 0,
             "is_timer_running_for_me": False,
-            "subtasks": subtasks_list
+            "subtasks": subtasks_list,
+            # Recurring task fields
+            "is_recurring": db_task.is_recurring,
+            "recurrence_frequency": db_task.recurrence_frequency,
+            "recurrence_time": db_task.recurrence_time,
+            "recurrence_day_of_week": db_task.recurrence_day_of_week,
+            "recurrence_date": db_task.recurrence_date,
+            "recurrence_day_of_month": db_task.recurrence_day_of_month,
+            "recurrence_start_date": db_task.recurrence_start_date
         }
         
         # Include stage object if stage_id is set (load it if needed)
@@ -247,23 +255,24 @@ def create_task(
         
         # Send email notifications to assigned user (in background)
         # Note: Collaborators are added separately, so we'll send email when they're added
-        from app.utils.email import send_task_creation_email
-        import threading
-        
-        # Prepare task details for email
-        creator_name = db_task.created_by_name or current_user.get("name") or current_user.get("email", "Unknown")
-        task_description = db_task.description
-        due_date_str = None
-        if db_task.due_date:
-            due_date_str = db_task.due_date.strftime("%Y-%m-%d")
-            if db_task.due_time:
-                due_date_str += f" at {db_task.due_time}"
-        priority_str = db_task.priority.value if db_task.priority else None
-        
-        # Send email to assigned user (in background thread)
-        if db_task.assigned_to:
-            logger.info(f"Task #{db_task.task_number} created - preparing to send email to assigned user {db_task.assigned_to}")
+        try:
+            from app.utils.email import send_task_creation_email
+            import threading
             
+            # Prepare task details for email
+            creator_name = db_task.created_by_name or current_user.get("name") or current_user.get("email", "Unknown")
+            task_description = db_task.description
+            due_date_str = None
+            if db_task.due_date:
+                due_date_str = db_task.due_date.strftime("%Y-%m-%d")
+                if db_task.due_time:
+                    due_date_str += f" at {db_task.due_time}"
+            priority_str = db_task.priority.value if db_task.priority else None
+            
+            # Send email to assigned user (in background thread)
+            if db_task.assigned_to:
+                logger.info(f"Task #{db_task.task_number} created - preparing to send email to assigned user {db_task.assigned_to}")
+                
             def send_email_to_assigned():
                 try:
                     logger.debug(f"Fetching email for assigned user {db_task.assigned_to}")
@@ -297,6 +306,9 @@ def create_task(
             email_thread = threading.Thread(target=send_email_to_assigned)
             email_thread.daemon = True
             email_thread.start()
+        except Exception as email_error:
+            # Log error but don't fail task creation if email sending fails
+            logger.warning(f"Failed to send task creation email: {str(email_error)}")
         
         return TaskSchema(**task_dict)
     except Exception as e:
@@ -320,6 +332,10 @@ def list_tasks(
     current_agency: dict = Depends(get_current_agency),
 ):
     from app.schemas.task import TaskListItem
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    logger.info(f"list_tasks called with: agency_id={current_agency['id']}, client_id={client_id}, assigned_to={assigned_to}, status={status}")
     
     # Show all tasks in the agency by default
     # Collaborators can access tasks they're added to via the task detail endpoint
@@ -334,6 +350,25 @@ def list_tasks(
         limit=limit,
         user_id=None  # Don't filter by user - show all tasks
     )
+    
+    logger.info(f"Found {len(tasks)} tasks for agency {current_agency['id']}, client_id filter: {client_id}")
+    
+    # DEBUG: Show all tasks for this agency to identify the issue
+    if client_id and len(tasks) == 0:
+        all_tasks = crud_task.get_tasks_by_agency(
+            db=db,
+            agency_id=current_agency["id"],
+            client_id=None,  # No filter
+            assigned_to=None,
+            status=None,
+            skip=0,
+            limit=10,
+            user_id=None
+        )
+        logger.warning(f"DEBUG: Found {len(all_tasks)} total tasks for agency (without client_id filter)")
+        for task in all_tasks[:5]:  # Show first 5
+            logger.warning(f"  Task ID: {task.id}, Title: {task.title}, client_id: {task.client_id}")
+    
     
     # Serialize tasks with stage information for Kanban view
     task_list = []
@@ -371,6 +406,7 @@ def list_tasks(
             "created_at": task.created_at,
             "updated_at": task.updated_at,
             "has_unread_messages": has_unread,
+            "is_recurring": task.is_recurring,
         }
         
         # Include stage object if loaded
@@ -482,7 +518,14 @@ def get_task(
         "updated_at": task.updated_at,
         "total_logged_seconds": total_seconds,
         "is_timer_running_for_me": is_timer_running_for_me,
-        "subtasks": subtasks_list
+        "subtasks": subtasks_list,
+        "is_recurring": task.is_recurring,
+        "recurrence_frequency": task.recurrence_frequency,
+        "recurrence_time": task.recurrence_time,
+        "recurrence_day_of_week": task.recurrence_day_of_week,
+        "recurrence_date": task.recurrence_date,
+        "recurrence_day_of_month": task.recurrence_day_of_month,
+        "recurrence_start_date": task.recurrence_start_date
     }
     
     # Include stage object if loaded
@@ -562,6 +605,53 @@ def update_task(
         except (ValueError, TypeError):
             pass
     
+    # If this is newly set to recurring, create the template
+    if task.is_recurring and task.recurrence_frequency and task.recurrence_start_date:
+        from app.schemas.recurring_task import RecurringTaskCreate, RecurrenceFrequency
+        from app import crud
+        
+        # Check if a recurring task with this title already exists for this agency (to avoid duplicates)
+        existing_recurring = db.query(crud.crud_recurring_task.RecurringTask).filter(
+            crud.crud_recurring_task.RecurringTask.agency_id == current_agency["id"],
+            crud.crud_recurring_task.RecurringTask.title == task.title,
+            crud.crud_recurring_task.RecurringTask.client_id == task.client_id
+        ).first()
+        
+        if not existing_recurring:
+            frequency_map = {
+                'daily': RecurrenceFrequency.daily,
+                'weekly': RecurrenceFrequency.weekly,
+                'monthly': RecurrenceFrequency.monthly
+            }
+            
+            recurring_task_data = RecurringTaskCreate(
+                title=task.title,
+                description=task.description,
+                client_id=task.client_id,
+                service_id=task.service_id,
+                priority=task.priority.value if task.priority and hasattr(task.priority, 'value') else task.priority,
+                assigned_to=task.assigned_to,
+                tag_id=task.tag_id,
+                document_request=task.document_request,
+                frequency=frequency_map.get(task.recurrence_frequency, RecurrenceFrequency.weekly),
+                interval=1,
+                start_date=task.recurrence_start_date,
+                end_date=None,
+                day_of_week=task.recurrence_day_of_week if task.recurrence_frequency == 'weekly' else None,
+                day_of_month=task.recurrence_day_of_month if task.recurrence_frequency == 'monthly' else None,
+                week_of_month=None,
+                due_date_offset=0,
+                target_date_offset=None,
+                is_active=True
+            )
+            
+            crud.crud_recurring_task.create_recurring_task(
+                db=db,
+                recurring_task=recurring_task_data,
+                agency_id=current_agency["id"],
+                user_id=UUID(current_user["id"])
+            )
+    
     # Serialize subtasks
     subtasks_list = []
     if task.subtasks:
@@ -606,7 +696,14 @@ def update_task(
         "updated_at": task.updated_at,
         "total_logged_seconds": total_seconds,
         "is_timer_running_for_me": is_timer_running_for_me,
-        "subtasks": subtasks_list
+        "subtasks": subtasks_list,
+        "is_recurring": task.is_recurring,
+        "recurrence_frequency": task.recurrence_frequency,
+        "recurrence_time": task.recurrence_time,
+        "recurrence_day_of_week": task.recurrence_day_of_week,
+        "recurrence_date": task.recurrence_date,
+        "recurrence_day_of_month": task.recurrence_day_of_month,
+        "recurrence_start_date": task.recurrence_start_date
     }
     
     # Include stage object if loaded

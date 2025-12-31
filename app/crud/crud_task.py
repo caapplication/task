@@ -30,15 +30,10 @@ def get_next_task_number(db: Session, agency_id: UUID) -> int:
 
 
 def create_task(db: Session, task: TaskCreate, agency_id: UUID, user_id: UUID) -> Task:
-    # Exclude recurring task fields and JSON fields from task_data
+    # Only exclude JSON fields that need special handling
     task_data = task.model_dump(exclude={
         "document_request", 
-        "checklist",
-        "is_recurring",
-        "recurrence_frequency",
-        "recurrence_day_of_week",
-        "recurrence_day_of_month",
-        "recurrence_start_date"
+        "checklist"
     })
     document_request = convert_uuid_to_str(task.document_request.model_dump()) if task.document_request else None
     checklist = convert_uuid_to_str(task.checklist.model_dump()) if task.checklist else None
@@ -96,12 +91,17 @@ def get_tasks_by_agency(
 ) -> List[Task]:
     from app.models.task_collaborator import TaskCollaborator
     from sqlalchemy import or_
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    logger.info(f"get_tasks_by_agency: agency_id={agency_id}, client_id={client_id}, assigned_to={assigned_to}, status={status}")
     
     query = db.query(Task).options(
         joinedload(Task.stage)  # Load stage relationship for Kanban view
     ).filter(Task.agency_id == agency_id)
     
     if client_id:
+        logger.info(f"Applying client_id filter: {client_id}")
         query = query.filter(Task.client_id == client_id)
     if assigned_to:
         query = query.filter(Task.assigned_to == assigned_to)
@@ -118,7 +118,10 @@ def get_tasks_by_agency(
         # For now, show all tasks - collaborators will see tasks they're added to via access control
         pass  # Removed filter to show all tasks
     
-    return query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+    results = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+    logger.info(f"Query returned {len(results)} tasks")
+    
+    return results
 
 def update_task(
     db: Session,

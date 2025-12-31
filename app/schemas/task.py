@@ -79,6 +79,14 @@ class TaskUpdate(BaseModel):
     document_request: Optional[DocumentRequest] = None
     checklist: Optional[Checklist] = None
     assigned_to: Optional[UUID] = None
+    
+    # Recurring task fields
+    is_recurring: Optional[bool] = None
+    recurrence_frequency: Optional[str] = None
+    recurrence_day_of_week: Optional[int] = None
+    recurrence_day_of_month: Optional[int] = None
+    recurrence_start_date: Optional[date] = None
+    recurrence_time: Optional[str] = None
 
 class Task(TaskBase):
     id: UUID
@@ -96,6 +104,15 @@ class Task(TaskBase):
     subtasks: Optional[List[dict]] = []  # Serialized as dict from router
     stage: Optional[dict] = None  # Stage object when loaded
     collaborators: Optional[List[dict]] = []  # Collaborators list
+    
+    # Recurring task fields
+    is_recurring: Optional[bool] = False
+    recurrence_frequency: Optional[str] = None
+    recurrence_time: Optional[str] = None
+    recurrence_day_of_week: Optional[int] = None
+    recurrence_date: Optional[date] = None
+    recurrence_day_of_month: Optional[int] = None
+    recurrence_start_date: Optional[date] = None
 
     class Config:
         from_attributes = True
@@ -103,6 +120,7 @@ class Task(TaskBase):
 
 class TaskListItem(BaseModel):
     has_unread_messages: Optional[bool] = False  # Indicates if user has unread messages
+    is_recurring: Optional[bool] = False  # Is this a recurring task?
     """Lightweight schema for list views"""
     id: UUID
     task_number: Optional[int] = None  # Sequential task number (T.ID)

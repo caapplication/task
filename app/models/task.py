@@ -38,6 +38,16 @@ class Task(Base):
     tag_id = Column(UUID(as_uuid=True), nullable=True)
     document_request = Column(JSON, nullable=True)  # {enabled: bool, items: [{name: str, required: bool}]}
     checklist = Column(JSON, nullable=True)  # {enabled: bool, items: [{name: str, is_completed: bool, assigned_to: UUID}]}
+    
+    # Recurring task fields
+    is_recurring = Column(Boolean, default=False, nullable=False)
+    recurrence_frequency = Column(String, nullable=True)  # 'daily', 'weekly', 'monthly', 'quarterly', 'half_yearly', 'yearly'
+    recurrence_time = Column(String, nullable=True)  # Time for daily recurrence (HH:mm format)
+    recurrence_day_of_week = Column(Integer, nullable=True)  # 0-6 (Monday-Sunday) for weekly
+    recurrence_date = Column(Date, nullable=True)  # Specific date for monthly/yearly
+    recurrence_day_of_month = Column(Integer, nullable=True)  # 1-31 for quarterly/half_yearly
+    recurrence_start_date = Column(Date, nullable=True)  # When recurrence starts
+    
     created_by = Column(UUID(as_uuid=True), nullable=False)
     created_by_name = Column(String, nullable=True)  # Store creator's name
     created_by_role = Column(String, nullable=True)  # Store creator's role
